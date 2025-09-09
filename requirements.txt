@@ -1,0 +1,40 @@
+"""
+Dependencies tối thiểu cho pipeline: Preprocess (PyVi) + Retrieval (FAISS + sentence-transformers) + API/UI + Gemini.
+"""
+
+# Retrieval
+sentence-transformers>=2.2.0
+
+# Data processing
+pandas>=1.5.0
+numpy>=1.21.0
+
+# Vector search
+# For GPU support (requires CUDA): pip install faiss-gpu
+# For CPU only: pip install faiss-cpu
+faiss-cpu>=1.7.0  # Change to faiss-gpu for GPU acceleration
+
+# Web framework
+fastapi>=0.85.0
+uvicorn>=0.18.0
+
+# UI
+streamlit>=1.12.0
+
+# Utilities
+python-dotenv>=1.0.0
+tqdm>=4.64.0
+pyyaml>=6.0
+requests>=2.28.0
+python-multipart>=0.0.5
+
+# Testing
+pytest>=7.1.0
+
+# Vietnamese NLP
+pyvi>=0.1.1
+
+# (loại bỏ các thư viện training local để tinh gọn)
+
+# Google Gemini API
+google-generativeai>=0.8.0

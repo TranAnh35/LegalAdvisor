@@ -1,0 +1,14 @@
+# LegalAdvisor Environment Variables
+# Copy this file to .env and fill in your actual values
+
+# Google Gemini API Key
+# Get your API key from: https://makersuite.google.com/app/apikey
+GOOGLE_API_KEY=your_google_gemini_api_key_here
+
+# Application Settings
+LOG_LEVEL=INFO
+MAX_TOKENS=1000
+TEMPERATURE=0.7
+
+# Database Settings (if using database)
+# DATABASE_URL=sqlite:///legaladvisor.db
