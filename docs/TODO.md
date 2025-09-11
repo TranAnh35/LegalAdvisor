@@ -52,7 +52,7 @@
 ### 1) Bối cảnh & Mục tiêu
 - VNLegalText hiện không đáp ứng độ đầy đủ/độ chính xác mong muốn. Chuyển sang kiến trúc RAG tối ưu hơn và fine-tune phù hợp với tài nguyên GPU 4GB.
 - Mục tiêu chính:
-  - Nâng Recall@5 và nDCG@10 cho retriever ≥ 0.75 trên bộ dev (VNLAWQC/ViRHE4QA).
+  - Nâng Recall@5 và nDCG@10 cho retriever ≥ 0.75 trên bộ dev (VNLAWQC/VNSynLawQC).
   - Tăng tính đúng đắn pháp lý: câu trả lời trích dẫn chính xác theo Luật/Điều/Khoản/Điểm.
   - Duy trì tốc độ đáp ứng API P50 ≤ 2.5s (context ≤ 3 nguồn, không rerank) và ≤ 4.5s (có rerank).
   - Dễ cấu hình (ENV/config), dễ tái lập kết quả.
@@ -82,27 +82,27 @@
 
 ### 4) Công việc chi tiết (checklist thực thi)
 
-#### 4.1 Datasets – Retriever
-- [ ] Tải/đặt VNLAWQC, VNSynLawQC, ViRHE4QA vào `data/raw/`
-- [ ] Viết `src/datasets/retrieval_prepare.py`:
-  - [ ] Chuẩn hóa schema; ánh xạ passage→chunk_id dựa trên `metadata.json`
-  - [ ] Sinh hard negatives (BM25/dense mining) và (tùy chọn) synthetic queries
-  - [ ] Xuất `data/processed/retrieval_train.jsonl`
-- [ ] Baseline retriever hiện tại: đo Recall@{1,5,10}, nDCG@10 (lưu vào `docs/EXPERIMENTS.md`)
+#### 4.1 Datasets – Retriever (VNLegalText-only)
+- [x] Quyết định dùng duy nhất VNLegalText làm nguồn retrieval
+- [x] Chuẩn hóa pipeline: build_index từ `smart_chunks_stable.db/parquet` → FAISS + metadata
+- [x] `src/datasets/retrieval_prepare.py`: hỗ trợ ánh xạ query→chunk_id (khi chỉ có query nội bộ)
+- [x] Nâng cấp chunking & metadata: Điều/Khoản/Điểm, `effective_*`, `promulgation_*`, `citations`
+- [x] Đánh giá baseline: Recall@{1,5,10}, nDCG@10 (lưu vào `docs/EXPERIMENTS.md`)
 
 #### 4.2 Fine-tune Bi-encoder (Sentence-Transformers)
-- [ ] Viết `src/retrieval/train_biencoder.py` (mặc định `intfloat/multilingual-e5-small`):
-  - [ ] Loss: MultipleNegativesRankingLoss; batch size 64 (gradient_accumulation nếu cần)
-  - [ ] Hard negatives từ file train; evaluation mỗi N steps trên dev
-  - [ ] Hyperparams: lr 2e-5, epochs 3–5, warmup 10%, max_len 512
-  - [ ] Xuất model ra `models/embeddings/legal-multilingual-e5-small-finetuned/`
+- [x] Viết `src/retrieval/train_biencoder.py` (mặc định `intfloat/multilingual-e5-small`):
+  - [x] Loss: MultipleNegativesRankingLoss; batch size 64 (gradient_accumulation nếu cần)
+  - [ ] Hard negatives từ file train
+  - [x] Evaluation mỗi N steps trên dev
+  - [x] Hyperparams: lr 2e-5, epochs 3–5, warmup 10%, max_len 512
+  - [x] Xuất model ra `models/embeddings/legal-multilingual-e5-small-finetuned/`
 - [ ] Cập nhật `models/retrieval/model_info.json` (model_name, dim, ntotal, uses_id_map)
 
 #### 4.3 Lập chỉ mục & Metadata
-- [ ] Cập nhật `src/retrieval/build_index.py` để load model mới, tạo embeddings, build FAISS (IP + L2 normalize)
-- [ ] Giữ `ids = chunk_id` để đồng bộ với content store; cập nhật `metadata.json` gọn nhẹ (preview ≤ 200 char)
-- [ ] Lưu `faiss_index.bin`, `metadata.json`, `model_info.json` vào `models/retrieval/`
-- [ ] Viết script kiểm chứng tính toàn vẹn: số vectors, đối chiếu id↔metadata
+- [x] Cập nhật `src/retrieval/build_index.py`: xác thực metadata, bổ sung trường `effective_date/effective_year`
+- [ ] Giữ `ids = chunk_id` đồng bộ với content store; rút gọn `preview ≤ 200 char`
+- [x] Lưu `faiss_index.bin`, `metadata.json`, `model_info.json` vào `models/retrieval/`
+- [ ] Script kiểm chứng tính toàn vẹn: số vectors, đối chiếu id↔metadata
 
 #### 4.4 Hybrid BM25 + Dense
 - [ ] Xây BM25 offline (`rank_bm25`) → `bm25_index.pkl` (nếu lớn, cân nhắc chỉ build cho title/heading)
@@ -117,14 +117,16 @@
 - [ ] Đánh giá tác động tốc độ vs. chất lượng; khuyến nghị bật khi cần độ chính xác cao
 
 #### 4.6 Đánh giá Retriever
-- [ ] Viết `scripts/eval_retrieval.py`:
+- [x] Thêm `scripts/eval_retrieval.py` (Recall/MRR/nDCG)
+- [x] Thêm `scripts/create_retrieval_eval.py` (tạo self-eval từ VNLegalText)
+  - [ ] Chạy đánh giá và ghi kết quả (JSON + Markdown)
   - [ ] Input: ground-truth pairs (query→gold chunk_id)
   - [ ] Metrics: Recall@k, MRR@k, nDCG@k; sinh bảng so sánh baseline vs. tuned/hybrid/rerank
 - [ ] Lưu kết quả (JSON + bảng Markdown) vào `docs/EXPERIMENTS.md`
 
 #### 4.7 Datasets – QA Generator
 - [ ] Viết `src/datasets/qa_prepare.py`:
-  - [ ] Nguồn: VLQA, ViBidLQA, (tùy chọn) ViRHE4QA cho extractive/abstractive
+  - [ ] Nguồn: VLQA, ViBidLQA
   - [ ] Chuẩn hóa: {question, context (passages+citation ids), answer, citations}
   - [ ] Lọc chất lượng, bỏ duplicate, cân bằng độ dài
 
@@ -171,7 +173,7 @@
 - Dung lượng index lớn → rút gọn preview, nén BM25 index, batch encode hợp lý
 
 ### 7) Theo dõi tiến độ (macro)
-- [ ] Datasets retriever chuẩn hóa xong
+- [x] Datasets retriever chuẩn hóa xong
 - [ ] Bi-encoder fine-tune xong và vượt baseline
 - [ ] FAISS + Hybrid + (Rerank tuỳ chọn) hoàn thiện, có báo cáo metric
 - [ ] QA dataset chuẩn hóa + LoRA/QLoRA huấn luyện xong

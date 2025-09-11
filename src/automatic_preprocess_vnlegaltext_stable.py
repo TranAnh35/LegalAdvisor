@@ -11,14 +11,22 @@ import json
 import re
 import time
 from pathlib import Path
-from utils.paths import get_project_root
+try:
+    # Khi chạy dạng module: python -m src.automatic_preprocess_vnlegaltext_stable
+    from src.utils.paths import get_project_root
+except Exception:
+    # Khi chạy trực tiếp: python src/automatic_preprocess_vnlegaltext_stable.py
+    from utils.paths import get_project_root  # type: ignore
 from typing import List, Dict, Any, Optional
 from tqdm import tqdm
 import sqlite3
 import argparse
 
 # Sinh smart chunks trực tiếp không qua JSON
-from export_chunks_storage import build_chunks_for_document
+try:
+    from src.export_chunks_storage import build_chunks_for_document
+except Exception:
+    from export_chunks_storage import build_chunks_for_document  # type: ignore
 
 # Import PyVi
 try:
@@ -35,8 +43,9 @@ class StableVNLegalTextProcessor:
         self.fast = fast
         self.patterns = {
             'article': re.compile(r'^\s*Điều\s+(\d+)\s*\.\s*(.*)$', re.MULTILINE),
-            'clause': re.compile(r'^\s*(\d+)\s*\.\s+(.*)$', re.MULTILINE),
-            'point': re.compile(r'^\s*\(?([a-z])\)\s+(.*)$', re.MULTILINE),
+            'clause': re.compile(r'^\s*(\d+)\s*\.(?:\s+|\s*)(.*)$', re.MULTILINE),
+            # Điểm: chấp nhận a) hoặc a ) hoặc (a), bao gồm chữ có dấu (đ, â, ê, ô, ă, ơ, ư ...)
+            'point': re.compile(r'^\s*(?:\(|\s*)?([a-zàáạảãăằắặẳẵâầấậẩẫđèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹ])\s*\)\s+(.*)$', re.MULTILINE | re.IGNORECASE),
             'chapter': re.compile(r'^\s*CHƯƠNG\s+([IVXLCDM]+|[0-9]+)\b\s*(.*)$', re.MULTILINE | re.IGNORECASE),
             'section': re.compile(r'^\s*Mục\s+(\d+)\b\s*(.*)$', re.MULTILINE | re.IGNORECASE)
         }
@@ -314,20 +323,55 @@ class StableVNLegalTextProcessor:
                     metadata['title'] = line
                     break
 
-            # Heuristic từ raw_text cho các trường phổ biến
+            # Heuristic từ raw_text cho các trường phổ biến + ngày tháng (hiệu lực / thông qua)
             if raw_text:
-                head = '\n'.join(raw_text.splitlines()[:120])
+                raw_norm = raw_text.replace('_', ' ')
+
+                # Vùng đầu văn bản: số, cơ quan, tình trạng
+                head = '\n'.join(raw_norm.splitlines()[:200])
                 patterns = {
                     'reference_number': r'\bSố[:\s]+([^\n]+)',
                     'issuing_body': r'\bCơ\s*quan\s*ban\s*hành[:\s]+([^\n]+)',
-                    'promulgation_date': r'\bNgày\s*ban\s*hành[:\s]+([^\n]+)',
-                    'effective_date': r'\bNgày\s*có\s*hiệu\s*lực[:\s]+([^\n]+)',
                     'status': r'\bTình\s*trạng[:\s]+([^\n]+)'
                 }
                 for key, pat in patterns.items():
                     m = re.search(pat, head, flags=re.IGNORECASE)
                     if m:
                         metadata[key] = m.group(1).strip()
+
+                # Tìm hiệu lực thi hành (ưu tiên điều Hiệu_lực thi_hành)
+                eff_match = re.search(r'hiệu\s*lực[^\n]*?từ\s+ngày\s+(\d{1,2})\s+tháng\s+(\d{1,2})\s+năm\s+(\d{4})', raw_norm, flags=re.IGNORECASE)
+                if not eff_match:
+                    eff_match = re.search(r'(\d{1,2})[\/-](\d{1,2})[\/-](\d{4}).{0,40}hiệu\s*lực', raw_norm, flags=re.IGNORECASE)
+                if eff_match:
+                    try:
+                        d, mth, y = int(eff_match.group(1)), int(eff_match.group(2)), int(eff_match.group(3))
+                        metadata['effective_date'] = f"{y:04d}-{mth:02d}-{d:02d}"
+                        metadata['effective_year'] = y
+                    except Exception:
+                        pass
+
+                # Tìm ngày thông qua ở phần cuối
+                tail = '\n'.join(raw_norm.splitlines()[-200:])
+                prom_match = re.search(r'thông\s*qua\s+ngày\s+(\d{1,2})\s+tháng\s+(\d{1,2})\s+năm\s+(\d{4})', tail, flags=re.IGNORECASE)
+                if prom_match:
+                    try:
+                        d, mth, y = int(prom_match.group(1)), int(prom_match.group(2)), int(prom_match.group(3))
+                        metadata['promulgation_date'] = f"{y:04d}-{mth:02d}-{d:02d}"
+                        metadata['promulgation_year'] = y
+                    except Exception:
+                        pass
+
+                # Trích citations từ tag <L|HP>
+                cites = []
+                for m in re.finditer(r'<(L|HP)([^>]*)>(.*?)</\1>', raw_text, flags=re.IGNORECASE | re.DOTALL):
+                    tag = m.group(1)
+                    attrs = m.group(2) or ''
+                    txt = re.sub(r'<[^>]+>', ' ', m.group(3)).strip()
+                    rel_m = re.search(r'rel\s*=\s*"([^"]+)"', attrs)
+                    cites.append({'type': tag.upper(), 'rel': rel_m.group(1) if rel_m else None, 'text': txt})
+                if cites:
+                    metadata['citations'] = cites
 
             return metadata
 
@@ -465,7 +509,12 @@ class StableVNLegalTextProcessor:
                 chunk_index   INTEGER,
                 content       TEXT,
                 word_count    INTEGER,
-                chunk_type    TEXT
+                chunk_type    TEXT,
+                effective_date TEXT,
+                effective_year INTEGER,
+                promulgation_date TEXT,
+                promulgation_year INTEGER,
+                citations     TEXT
             )
             """
         )
@@ -535,6 +584,14 @@ class StableVNLegalTextProcessor:
                         # Xây smart chunks cho tài liệu này
                         doc_chunks = build_chunks_for_document(result, start_chunk_id=total_chunks)
 
+                        # Lấy ngày tháng/citations từ metadata (nếu có)
+                        eff_date = result.get('metadata', {}).get('effective_date')
+                        eff_year = result.get('metadata', {}).get('effective_year')
+                        prom_date = result.get('metadata', {}).get('promulgation_date')
+                        prom_year = result.get('metadata', {}).get('promulgation_year')
+                        citations = result.get('metadata', {}).get('citations')
+                        citations_json = json.dumps(citations, ensure_ascii=False) if citations else None
+
                         # Chuẩn hóa và chèn vào SQLite
                         rows = []
                         for ch in doc_chunks:
@@ -573,11 +630,16 @@ class StableVNLegalTextProcessor:
                                 content,
                                 word_count,
                                 chunk_type,
+                                eff_date,
+                                to_int(eff_year),
+                                prom_date,
+                                to_int(prom_year),
+                                citations_json,
                             ))
 
                         if rows:
                             cur.executemany(
-                                'INSERT INTO chunks (chunk_id, doc_file, doc_title, chapter, section, article, article_heading, clause, point, chunk_index, content, word_count, chunk_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                'INSERT INTO chunks (chunk_id, doc_file, doc_title, chapter, section, article, article_heading, clause, point, chunk_index, content, word_count, chunk_type, effective_date, effective_year, promulgation_date, promulgation_year, citations) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                                 rows
                             )
                             total_chunks += len(rows)
@@ -621,7 +683,7 @@ class StableVNLegalTextProcessor:
                 if has_pa:
                     conn = sqlite3.connect(str(db_path))
                     df = pd.read_sql_query(
-                        'SELECT chunk_id, doc_file, doc_title, chapter, section, article, article_heading, clause, point, chunk_index, content, word_count, chunk_type FROM chunks ORDER BY chunk_id',
+                        'SELECT chunk_id, doc_file, doc_title, chapter, section, article, article_heading, clause, point, chunk_index, content, word_count, chunk_type, effective_date, effective_year, promulgation_date, promulgation_year, citations FROM chunks ORDER BY chunk_id',
                         conn
                     )
                     df.to_parquet(parquet_path, engine='pyarrow', index=False)

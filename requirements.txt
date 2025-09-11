@@ -38,3 +38,6 @@ pyvi>=0.1.1
 
 # Google Gemini API
 google-generativeai>=0.8.0
+
+# Datasets tải từ Hugging Face
+datasets>=2.19.0

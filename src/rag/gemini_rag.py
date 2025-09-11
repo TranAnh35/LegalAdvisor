@@ -31,7 +31,9 @@ def format_retrieved_docs(docs: List[Dict[str, Any]]) -> str:
     """Format retrieved documents với tên luật + điều/khoản/điểm và tóm tắt ngắn."""
     formatted_docs: List[str] = []
     for i, doc in enumerate(docs, 1):
-        law_title = doc.get('law_title') or doc.get('title') or doc.get('doc_file')
+        base = doc.get('law_title') or doc.get('title') or doc.get('doc_file')
+        eff_year = doc.get('effective_year')
+        law_title = f"{base} ({int(eff_year)})" if eff_year else base
         article = doc.get('article')
         clause = doc.get('clause')
         point = doc.get('point')
@@ -193,7 +195,9 @@ class GeminiRAG:
             if retrieved_docs:
                 lines = []
                 for i, d in enumerate(retrieved_docs, 1):
-                    law_title = d.get('law_title') or d.get('title') or d.get('doc_file')
+                    base = d.get('law_title') or d.get('title') or d.get('doc_file')
+                    ey = d.get('effective_year')
+                    law_title = f"{base} ({int(ey)})" if ey else base
                     parts = []
                     if d.get('article'):
                         parts.append(f"Điều {d.get('article')}")

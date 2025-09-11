@@ -89,8 +89,15 @@ class RetrievalService:
 
                 content = self.get_chunk_content(chunk_id) or meta.get('preview', '')
 
-                # Tạo tiêu đề ưu tiên: Tên luật → Điều/Khoản/Điểm → heading
+                # Tạo tiêu đề ưu tiên: Tên luật (năm) → Điều/Khoản/Điểm → heading
                 base_title = meta.get('doc_title') or meta.get('doc_file') or f'chunk_{chunk_id}.txt'
+                effective_year = meta.get('effective_year')
+                if effective_year:
+                    try:
+                        year_int = int(effective_year)
+                        base_title = f"{base_title} ({year_int})"
+                    except Exception:
+                        pass
                 parts: List[str] = []
                 if meta.get('article'):
                     parts.append(f"Điều {meta.get('article')}")
@@ -116,7 +123,9 @@ class RetrievalService:
                     'law_title': meta.get('doc_title'),
                     'article': meta.get('article'),
                     'clause': meta.get('clause'),
-                    'point': meta.get('point')
+                    'point': meta.get('point'),
+                    'effective_year': meta.get('effective_year'),
+                    'effective_date': meta.get('effective_date')
                 })
 
             return results

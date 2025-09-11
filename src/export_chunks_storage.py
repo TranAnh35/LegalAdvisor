@@ -9,7 +9,10 @@ Tiện ích xuất smart chunks sang định dạng tối ưu: Parquet (nếu c�
 
 import sqlite3
 from pathlib import Path
-from utils.paths import get_processed_data_dir
+try:
+    from src.utils.paths import get_processed_data_dir
+except Exception:
+    from utils.paths import get_processed_data_dir  # type: ignore
 from typing import Any, Dict, List, Optional
 
 

@@ -47,7 +47,18 @@ def load_document_chunks():
                 print(f"📖 Đọc SQLite: {sqlite_file}")
                 conn = sqlite3.connect(str(sqlite_file))
                 cur = conn.cursor()
-                cur.execute(
+                # Cố gắng đọc thêm các cột metadata mở rộng nếu tồn tại
+                query_extended = (
+                    """
+                    SELECT chunk_id, doc_file, doc_title, chapter, section, article,
+                           article_heading, clause, point, chunk_index, content,
+                           word_count, chunk_type,
+                           effective_date, effective_year, promulgation_date, promulgation_year, citations
+                    FROM chunks
+                    ORDER BY chunk_id
+                    """
+                )
+                query_basic = (
                     """
                     SELECT chunk_id, doc_file, doc_title, chapter, section, article,
                            article_heading, clause, point, chunk_index, content,
@@ -56,12 +67,24 @@ def load_document_chunks():
                     ORDER BY chunk_id
                     """
                 )
+                try:
+                    cur.execute(query_extended)
+                    rows = cur.fetchall()
+                    cols = [
+                        'chunk_id', 'doc_file', 'doc_title', 'chapter', 'section', 'article',
+                        'article_heading', 'clause', 'point', 'chunk_index', 'content',
+                        'word_count', 'chunk_type', 'effective_date', 'effective_year',
+                        'promulgation_date', 'promulgation_year', 'citations'
+                    ]
+                except Exception:
+                    cur.execute(query_basic)
+                    rows = cur.fetchall()
+                    cols = [
+                        'chunk_id', 'doc_file', 'doc_title', 'chapter', 'section', 'article',
+                        'article_heading', 'clause', 'point', 'chunk_index', 'content',
+                        'word_count', 'chunk_type'
+                    ]
                 rows = cur.fetchall()
-                cols = [
-                    'chunk_id', 'doc_file', 'doc_title', 'chapter', 'section', 'article',
-                    'article_heading', 'clause', 'point', 'chunk_index', 'content',
-                    'word_count', 'chunk_type'
-                ]
                 chunks = [dict(zip(cols, row)) for row in rows]
                 conn.close()
             except Exception as e:
@@ -96,38 +119,67 @@ def load_document_chunks():
         'clause': chunk.get('clause'),
         'point': chunk.get('point'),
         'chunk_type': chunk.get('chunk_type'),
+        # Metadata mở rộng nếu có
+        'effective_date': chunk.get('effective_date'),
+        'effective_year': chunk.get('effective_year'),
+        'promulgation_date': chunk.get('promulgation_date'),
+        'promulgation_year': chunk.get('promulgation_year'),
+        'citations': chunk.get('citations'),
         # Preview ngắn để giữ dung lượng
         'preview': normalize_for_embedding(chunk.get('content', ''))[:200]
     } for chunk in chunks]
 
     return texts, metadata, ids
 
-def create_embeddings(texts, model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
+def create_embeddings(texts, model_name: str, batch_size: int, device: str):
     """Tạo embeddings cho texts"""
 
     print(f"🤖 Load model: {model_name}")
 
-    # Load model
-    use_gpu_env = os.getenv("LEGALADVISOR_USE_GPU", "auto").lower()
-    if use_gpu_env == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    elif use_gpu_env in ("1", "true", "yes", "on", "cuda", "gpu"):
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Chuẩn hóa & kiểm tra thiết bị
+    requested_device = (device or "auto").lower()
+    if requested_device == "auto":
+        effective_device = "cuda" if torch.cuda.is_available() else "cpu"
+    elif requested_device == "cuda":
+        if not torch.cuda.is_available():
+            print(
+                f"❌ Đã yêu cầu CUDA nhưng torch.cuda.is_available()=False. Vui lòng chạy trong môi trường GPU."
+            )
+            raise RuntimeError("CUDA requested but not available")
+        effective_device = "cuda"
+    elif requested_device == "cpu":
+        effective_device = "cpu"
     else:
-        device = "cpu"
+        # chấp nhận các alias phổ biến
+        if requested_device in ("1", "true", "yes", "on", "gpu"):
+            effective_device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            effective_device = "cpu"
 
-    print(f"🖥️  Device: {device}")
-    model = SentenceTransformer(model_name, device=device)
+    try:
+        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
+    except Exception:
+        gpu_name = "N/A"
+
+    print(
+        f"🖥️  Device requested: {requested_device} | cuda_available={torch.cuda.is_available()} | "
+        f"num_devices={torch.cuda.device_count()} | using={effective_device} | gpu0={gpu_name}"
+    )
+    model = SentenceTransformer(model_name, device=effective_device)
 
     print("🔄 Tạo embeddings...")
 
     # Tạo embeddings theo batch để tránh memory error
-    batch_size = int(os.getenv("LEGALADVISOR_EMB_BATCH", "256"))
     embeddings = []
 
     for i in tqdm(range(0, len(texts), batch_size), desc="Creating embeddings"):
         batch_texts = texts[i:i+batch_size]
-        batch_embeddings = model.encode(batch_texts, convert_to_numpy=True, normalize_embeddings=False)
+        batch_embeddings = model.encode(
+            batch_texts,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+            device=effective_device,
+        )
         embeddings.append(batch_embeddings)
 
     # Ghép tất cả embeddings
@@ -135,7 +187,7 @@ def create_embeddings(texts, model_name="sentence-transformers/paraphrase-multil
 
     print(f"📊 Embeddings shape: {embeddings.shape}")
 
-    return embeddings, model
+    return embeddings, model, effective_device
 
 def build_faiss_index(embeddings, ids=None):
     """Build FAISS index từ embeddings.
@@ -168,7 +220,7 @@ def build_faiss_index(embeddings, ids=None):
 
     return index
 
-def save_index_and_metadata(index, metadata, model, output_dir="../models/retrieval", used_id_map=True):
+def save_index_and_metadata(index, metadata, model_name: str, emb_batch: int, device: str, output_dir="../models/retrieval", used_id_map=True):
     """Lưu FAISS index và metadata"""
 
     # Luôn lưu về thư mục models/retrieval tại gốc dự án
@@ -189,10 +241,12 @@ def save_index_and_metadata(index, metadata, model, output_dir="../models/retrie
 
     # Lưu model info
     model_info = {
-        "model_name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "model_name": model_name,
         "embedding_dim": index.d,
         "num_chunks": index.ntotal,
-        "uses_id_map": bool(used_id_map)
+        "uses_id_map": bool(used_id_map),
+        "batch_size": emb_batch,
+        "device": device,
     }
 
     model_info_path = output_dir / "model_info.json"
@@ -205,6 +259,14 @@ def main():
 
     print("🚀 Bắt đầu tạo FAISS index cho retrieval...")
 
+    # CLI args
+    import argparse
+    parser = argparse.ArgumentParser(description="Build FAISS index for LegalAdvisor")
+    parser.add_argument("--model", type=str, default=None, help="Tên model HF hoặc đường dẫn local đến SentenceTransformer đã fine-tune")
+    parser.add_argument("--emb-batch", type=int, default=None, help="Batch size khi tạo embedding (mặc định từ env LEGALADVISOR_EMB_BATCH hoặc 256)")
+    parser.add_argument("--device", type=str, default=None, choices=["auto", "cpu", "cuda"], help="Thiết bị encode: auto/cpu/cuda (mặc định auto hoặc từ LEGALADVISOR_USE_GPU)")
+    args = parser.parse_args()
+
     # Load document chunks
     loaded = load_document_chunks()
     if loaded is None or loaded[0] is None:
@@ -212,13 +274,33 @@ def main():
     texts, metadata, ids = loaded
 
     # Tạo embeddings
-    embeddings, model = create_embeddings(texts)
+    # Resolve model name
+    model_name = (
+        args.model
+        or os.getenv("LEGALADVISOR_EMB_MODEL")
+        or "intfloat/multilingual-e5-small"
+    )
+    # Resolve batch size
+    emb_batch = args.emb_batch if args.emb_batch is not None else int(os.getenv("LEGALADVISOR_EMB_BATCH", "256"))
+    # Resolve device
+    device = args.device if args.device is not None else os.getenv("LEGALADVISOR_USE_GPU", "auto").lower()
+
+    embeddings, _, effective_device = create_embeddings(
+        texts, model_name=model_name, batch_size=emb_batch, device=device
+    )
 
     # Build FAISS index
     index = build_faiss_index(embeddings, ids=ids)
 
     # Lưu index và metadata
-    save_index_and_metadata(index, metadata, model, used_id_map=True)
+    save_index_and_metadata(
+        index,
+        metadata,
+        model_name=model_name,
+        emb_batch=emb_batch,
+        device=effective_device,
+        used_id_map=True,
+    )
 
     print("\n✅ Hoàn thành tạo FAISS index!")
     print("📁 Các file được lưu tại: ../models/retrieval/")
