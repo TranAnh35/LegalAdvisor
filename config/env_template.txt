@@ -5,6 +5,18 @@
 # Get your API key from: https://makersuite.google.com/app/apikey
 GOOGLE_API_KEY=your_google_gemini_api_key_here
 
+# Embedding
+LEGALADVISOR_EMB_MODEL=VoVanPhuc/sup-SimCSE-VietNamese-phobert-base
+LEGALADVISOR_EMB_KEEP_UNDERSCORE=1
+LEGALADVISOR_EMB_BATCH=256
+LEGALADVISOR_USE_GPU=auto  # hoặc 1 để ép GPU nếu sẵn CUDA
+
+# FAISS HNSW (tùy chọn, để tăng tốc truy vấn)
+LEGALADVISOR_FAISS_HNSW=1
+LEGALADVISOR_HNSW_M=32
+LEGALADVISOR_HNSW_EF_CONSTRUCTION=200
+LEGALADVISOR_HNSW_EF_SEARCH=64
+
 # Application Settings
 LOG_LEVEL=INFO
 MAX_TOKENS=1000

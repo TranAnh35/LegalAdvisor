@@ -13,9 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
 import requests
-import json
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # Cấu hình trang
 st.set_page_config(
@@ -26,7 +25,15 @@ st.set_page_config(
 )
 
 # API endpoint
-API_BASE_URL = "http://localhost:8000"
+API_BASE_URL = os.getenv("LEGALADVISOR_API_BASE_URL", "http://localhost:8000")
+
+# Session state defaults
+if "question_input" not in st.session_state:
+    st.session_state["question_input"] = ""
+if "source_contents" not in st.session_state:
+    st.session_state["source_contents"] = {}
+if "source_errors" not in st.session_state:
+    st.session_state["source_errors"] = {}
 
 def check_api_health(max_retries=3, timeout=5):
     """Kiểm tra trạng thái API với retry"""
@@ -50,13 +57,20 @@ def check_api_health(max_retries=3, timeout=5):
 
     return None
 
-def ask_question(question: str, top_k: int = 3) -> Dict[str, Any]:
+def ask_question(question: str, top_k: int = 3) -> Optional[Dict[str, Any]]:
     """Gửi câu hỏi đến API"""
     try:
         payload = {"question": question, "top_k": top_k}
         response = requests.post(f"{API_BASE_URL}/ask", json=payload)
-        return response.json() if response.status_code == 200 else None
-    except Exception as e:
+        try:
+            data = response.json()
+        except ValueError:
+            data = {"message": response.text or "Unknown error"}
+
+        data.setdefault("status_code", response.status_code)
+        data["ok"] = response.status_code == 200
+        return data
+    except requests.RequestException as e:
         st.error(f"Lỗi kết nối API: {str(e)}")
         return None
 
@@ -66,6 +80,30 @@ def get_stats():
         response = requests.get(f"{API_BASE_URL}/stats")
         return response.json() if response.status_code == 200 else None
     except:
+        return None
+
+
+def get_health_details():
+    try:
+        response = requests.get(f"{API_BASE_URL}/health/details", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        pass
+    return None
+
+
+def trigger_reinitialize_rag():
+    try:
+        response = requests.post(f"{API_BASE_URL}/debug/reinit", timeout=10)
+        try:
+            data = response.json()
+        except ValueError:
+            data = {"message": response.text or "Unknown error"}
+        data.setdefault("status_code", response.status_code)
+        return data
+    except Exception as e:
+        st.error(f"Không thể gọi reinit: {e}")
         return None
 
 def main():
@@ -87,10 +125,23 @@ def main():
         return
 
         # Kiểm tra RAG system
+    health_details = get_health_details()
+
     if not health.get("rag_loaded", False):
         st.warning("⚠️ RAG system chưa được tải. Một số tính năng có thể không hoạt động.")
         st.info("💡 Kiểm tra GOOGLE_API_KEY và khởi động API bằng launcher:")
         st.code("$env:GOOGLE_API_KEY='YOUR_KEY'; python launcher.py")
+        if st.button("🔄 Thử khởi động lại RAG", use_container_width=True):
+            reinit_result = trigger_reinitialize_rag()
+            if reinit_result and reinit_result.get("status_code") == 200 and reinit_result.get("rag_loaded"):
+                st.success("✅ Đã yêu cầu khởi động lại RAG thành công. Vui lòng đợi vài giây rồi thử lại.")
+            elif reinit_result:
+                message = reinit_result.get("message") or reinit_result.get("detail") or "Không thể khởi động lại RAG."
+                st.error(f"❌ {message}")
+                if reinit_result.get("rag_error"):
+                    st.error(f"Lỗi: {reinit_result['rag_error']}")
+            else:
+                st.error("❌ Không thể khởi động lại RAG.")
 
     # Sidebar
     with st.sidebar:
@@ -99,6 +150,12 @@ def main():
         if health:
             st.success(f"✅ API: {health['status']}")
             st.info(f"RAG System: {'✅ Loaded' if health['rag_loaded'] else '❌ Not loaded'}")
+            if health_details:
+                st.caption(
+                    f"🕒 Lần thử RAG cuối: {health_details.get('last_attempt_at') or 'Chưa có'}\n"
+                    f"✅ Lần thành công cuối: {health_details.get('last_success_at') or 'Chưa có'}\n"
+                    f"🔁 Số lần thử: {health_details.get('retry_attempts', 0)}"
+                )
 
         # Thống kê
         stats = get_stats()
@@ -123,8 +180,11 @@ def main():
         question = st.text_area(
             "Nhập câu hỏi của bạn:",
             height=100,
-            placeholder="Ví dụ: Quyền của công dân là gì? Thủ tục ly hôn như thế nào?"
+            placeholder="Ví dụ: Quyền của công dân là gì? Thủ tục ly hôn như thế nào?",
+            value=st.session_state.get("question_input", ""),
+            key="question_text_area"
         )
+        st.session_state["question_input"] = question
 
         # Settings
         col_a, col_b = st.columns(2)
@@ -138,7 +198,9 @@ def main():
             with st.spinner("🔄 Đang xử lý câu hỏi..."):
                 result = ask_question(question.strip(), top_k)
 
-                if result:
+                if result is None:
+                    st.error("❌ Không thể gửi câu hỏi. Kiểm tra kết nối API.")
+                elif result.get("ok"):
                     # Hiển thị kết quả
                     st.success("✅ Đã tìm thấy câu trả lời!")
 
@@ -155,27 +217,62 @@ def main():
                         st.subheader("📚 Nguồn tài liệu")
 
                         for i, source in enumerate(result["sources"], 1):
-                            with st.expander(f"📄 Nguồn {i}: {source.get('title', source.get('doc_file', f'Nguồn {i}'))}"):
+                            # Tiêu đề thân thiện: thay '_' bằng khoảng trắng
+                            raw_title = source.get('title', source.get('doc_file', f'Nguồn {i}')) or f'Nguồn {i}'
+                            disp_title = str(raw_title).replace('_', ' ')
+                            chunk_id = source.get('chunk_id')
+                            button_key = f"source_btn_{chunk_id}"
+                            with st.expander(f"📄 Nguồn {i}: {disp_title}"):
                                 st.write(f"**Điểm số:** {source['score']:.4f}")
-                                st.write(f"**File:** {source.get('title', source.get('doc_file', 'N/A'))}")
+                                st.write(f"**File:** {disp_title}")
 
                                 # Lấy nội dung chunk nếu cần
-                                if st.button(f"Xem nội dung", key=f"source_{i}"):
+                                if chunk_id is not None and st.button("Xem nội dung", key=button_key):
                                     try:
-                                        chunk_response = requests.get(f"{API_BASE_URL}/sources/{source['chunk_id']}")
+                                        chunk_response = requests.get(f"{API_BASE_URL}/sources/{chunk_id}")
                                         if chunk_response.status_code == 200:
                                             chunk_data = chunk_response.json()
-                                            st.text_area(
-                                                "Nội dung tài liệu:",
-                                                chunk_data.get("content", "Không có nội dung"),
-                                                height=200,
-                                                disabled=True
-                                            )
-                                    except:
-                                        st.error("Không thể tải nội dung")
+                                            content = (chunk_data.get("content", "Không có nội dung") or "").replace('_', ' ')
+                                            st.session_state["source_contents"][chunk_id] = content
+                                            st.session_state["source_errors"].pop(chunk_id, None)
+                                        else:
+                                            st.session_state["source_errors"][chunk_id] = f"Status: {chunk_response.status_code}"
+                                    except Exception as exc:
+                                        st.session_state["source_errors"][chunk_id] = str(exc)
+
+                                if chunk_id is not None and chunk_id in st.session_state["source_contents"]:
+                                    st.text_area(
+                                        "Nội dung tài liệu:",
+                                        st.session_state["source_contents"][chunk_id],
+                                        height=200,
+                                        disabled=True
+                                    )
+                                elif chunk_id is not None and chunk_id in st.session_state["source_errors"]:
+                                    st.error(f"Không thể tải nội dung: {st.session_state['source_errors'][chunk_id]}")
 
                 else:
-                    st.error("❌ Không thể xử lý câu hỏi. Vui lòng thử lại.")
+                    detail = result.get("detail") or result.get("message") or result.get("error")
+                    if isinstance(detail, dict):
+                        primary_msg = detail.get("message") or detail.get("error") or "Không thể xử lý câu hỏi."
+                        hint = detail.get("hint")
+                        retry_after = detail.get("retry_after") or detail.get("retry_after_seconds")
+                    else:
+                        primary_msg = detail or "Không thể xử lý câu hỏi."
+                        hint = None
+                        retry_after = None
+
+                    status_code = result.get("status_code")
+                    if status_code == 429:
+                        st.error(f"❌ {primary_msg}")
+                        if retry_after:
+                            st.info(f"Vui lòng thử lại sau khoảng {retry_after} giây.")
+                    else:
+                        st.error(f"❌ {primary_msg}")
+                    if hint:
+                        st.info(f"💡 {hint}")
+
+                    with st.expander("Chi tiết lỗi"):
+                        st.json(result)
 
     with col2:
         st.subheader("📝 Câu hỏi mẫu")
@@ -189,12 +286,13 @@ def main():
         ]
 
         for q in sample_questions:
-            if st.button(q, use_container_width=True):
-                st.session_state.question = q
+            if st.button(q, use_container_width=True, key=f"sample_{q}"):
+                st.session_state["question_input"] = q
+                st.session_state["selected_sample"] = q
 
         # Copy từ session state
-        if "question" in st.session_state:
-            st.text_area("Câu hỏi được chọn:", st.session_state.question, disabled=True)
+        if st.session_state.get("selected_sample"):
+            st.text_area("Câu hỏi được chọn:", st.session_state["selected_sample"], disabled=True)
 
     # Footer
     st.markdown("---")

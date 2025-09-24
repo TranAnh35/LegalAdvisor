@@ -8,6 +8,7 @@ Tiện ích xuất smart chunks sang định dạng tối ưu: Parquet (nếu c�
 """
 
 import sqlite3
+import re
 from pathlib import Path
 from utils.paths import get_processed_data_dir
 from typing import Any, Dict, List, Optional
@@ -17,20 +18,55 @@ def _normalize_spaces(text: str) -> str:
     return ' '.join((text or '').split()).strip()
 
 
-def _compose_article_text(article_num: str, heading: str, content: str) -> str:
-    header = f"Điều {article_num}. {heading}".strip()
+def _compose_article_text(article_num: str, heading: str, content: str,
+                          chapter: Optional[str] = None,
+                          section: Optional[str] = None) -> str:
+    context_parts: List[str] = []
+    if chapter:
+        context_parts.append(str(chapter))
+    if section:
+        context_parts.append(str(section))
+    context = " – ".join(context_parts)
+    header_core = f"Điều {article_num}"
+    if heading:
+        header_core = f"{header_core}. {heading}"
+    header = f"{context}\n{header_core}" if context else header_core
     header = header.rstrip('.') if header.endswith('..') else header
     body = content or ''
     return (header + "\n" + body).strip()
 
 
-def _compose_clause_text(article_num: str, clause_num: str, clause_content: str) -> str:
-    prefix = f"Điều {article_num} - Khoản {clause_num}. "
+def _compose_clause_text(article_num: str, clause_num: str, clause_content: str,
+                         chapter: Optional[str] = None,
+                         section: Optional[str] = None,
+                         article_heading: Optional[str] = None) -> str:
+    context_parts: List[str] = []
+    if chapter:
+        context_parts.append(str(chapter))
+    if section:
+        context_parts.append(str(section))
+    header_core = f"Điều {article_num}"
+    if article_heading:
+        header_core = f"{header_core}. {article_heading}"
+    header = f"{' – '.join(context_parts)}\n{header_core}" if context_parts else header_core
+    prefix = f"{header} - Khoản {clause_num}. "
     return (prefix + (clause_content or '')).strip()
 
 
-def _compose_point_text(article_num: str, clause_num: str, point_label: str, point_content: str) -> str:
-    prefix = f"Điều {article_num} - Khoản {clause_num} - Điểm {point_label}) "
+def _compose_point_text(article_num: str, clause_num: str, point_label: str, point_content: str,
+                        chapter: Optional[str] = None,
+                        section: Optional[str] = None,
+                        article_heading: Optional[str] = None) -> str:
+    context_parts: List[str] = []
+    if chapter:
+        context_parts.append(str(chapter))
+    if section:
+        context_parts.append(str(section))
+    header_core = f"Điều {article_num}"
+    if article_heading:
+        header_core = f"{header_core}. {article_heading}"
+    header = f"{' – '.join(context_parts)}\n{header_core}" if context_parts else header_core
+    prefix = f"{header} - Khoản {clause_num} - Điểm {point_label}) "
     return (prefix + (point_content or '')).strip()
 
 
@@ -47,32 +83,71 @@ def build_chunks_for_document(doc: Dict[str, Any], start_chunk_id: int) -> List[
     def normalize_for_db(text: str) -> str:
         if not text:
             return ''
-        text = text.replace('_', ' ')
+        # Giữ dấu '_' để phục vụ embedding giữ cụm từ ghép; UI sẽ thay thế khi hiển thị
         return ' '.join(text.split()).strip()
 
+    def _recursive_split(text: str, chunk_size: int = 512, overlap: int = 128) -> List[str]:
+        """Chia văn bản theo ký tự (không đệ quy), ưu tiên ranh giới câu/đoạn, có overlap."""
+        text = (text or '').strip()
+        if not text:
+            return []
+
+        segments: List[str] = []
+
+        punctuation = ['. ', '! ', '? ', '; ']
+
+        # Ưu tiên tách theo đoạn rỗng
+        paragraphs = [p for p in re.split(r"\n\n+", text) if p.strip()] if '\n' in text else [text]
+
+        for para in paragraphs:
+            L = len(para)
+            start = 0
+            while start < L:
+                window_end = min(start + chunk_size + 1, L)
+                window = para[start:window_end]
+
+                # Tìm điểm cắt tốt nhất trong window
+                cut_offset = -1
+                for p in punctuation:
+                    idx = window.rfind(p)
+                    if idx > cut_offset:
+                        cut_offset = idx + len(p)
+                if cut_offset <= 0:
+                    idx = window.rfind('\n')
+                    if idx > 0:
+                        cut_offset = idx + 1
+                if cut_offset <= 0:
+                    cut_offset = min(chunk_size, window_end - start)
+
+                cut = start + cut_offset
+                head = para[start:cut].strip()
+                if head:
+                    segments.append(head)
+                if cut >= L:
+                    break
+                # Tiến tới, có overlap
+                start = max(cut - overlap, start + 1)
+
+        # Lọc bỏ đoạn quá ngắn
+        return [s for s in segments if len(s.split()) >= 20]
+
     if not sections:
-        # Fallback: chia thô theo độ dài nếu không có cấu trúc
+        # Fallback: chia theo RecursiveCharacterTextSplitter mô phỏng (512/128)
         text = doc.get('cleaned_content_index') or doc.get('cleaned_content') or ''
-        words = text.split()
-        chunk_size, overlap = 400, 50
-        idx = 0
+        parts = _recursive_split(text, chunk_size=512, overlap=128)
         per_doc_index = 0
-        while idx < len(words):
-            part = words[idx: idx + chunk_size]
-            if len(part) >= 80:
-                content = ' '.join(part)
-                content = normalize_for_db(content)
-                chunks.append({
-                    'chunk_id': start_chunk_id + len(chunks),
-                    'doc_file': doc.get('file_name'),
-                    'doc_title': (doc.get('metadata') or {}).get('title'),
-                    'chunk_index': per_doc_index,
-                    'content': content,
-                    'word_count': len(part),
-                    'chunk_type': 'fallback'
-                })
-                per_doc_index += 1
-            idx += (chunk_size - overlap)
+        for part in parts:
+            content = normalize_for_db(part)
+            chunks.append({
+                'chunk_id': start_chunk_id + len(chunks),
+                'doc_file': doc.get('file_name'),
+                'doc_title': (doc.get('metadata') or {}).get('title'),
+                'chunk_index': per_doc_index,
+                'content': content,
+                'word_count': len(content.split()),
+                'chunk_type': 'fallback'
+            })
+            per_doc_index += 1
         return chunks
 
     # Duyệt tuyến tính để gom theo cấu trúc
@@ -126,10 +201,20 @@ def build_chunks_for_document(doc: Dict[str, Any], start_chunk_id: int) -> List[
         art_heading = _normalize_spaces(art.get('article_heading') or '')
         art_content = _normalize_spaces(art.get('article_content') or '')
 
-        # Chunk cấp Điều (nếu có nội dung và KHÔNG có clause nào) để tránh trùng lặp với Khoản/Điểm
-        has_any_clause = bool(art.get('clauses'))
-        if art_content and not has_any_clause:
-            content = _compose_article_text(art_num or '', art_heading, art_content)
+        # Chunk cấp Điều: luôn tạo 1 chunk head chứa heading + phần mở đầu (để gắn mối liên hệ Điều, kể cả khi có Khoản)
+        # Lấy đoạn mở đầu tối đa ~3 câu từ nội dung Điều
+        head_intro = ''
+        if art_content:
+            boundary = max(art_content.find('. '), art_content.find('\n'))
+            if boundary == -1:
+                head_intro = art_content[:300]
+            else:
+                head_intro = art_content[:min(len(art_content), 600)]
+        if art_heading or head_intro:
+            content = _compose_article_text(
+                art_num or '', art_heading, art_content,
+                chapter=art.get('chapter_title'), section=art.get('section_title')
+            )
             content = normalize_for_db(content)
             chunks.append({
                 'chunk_id': start_chunk_id + len(chunks),
@@ -154,7 +239,11 @@ def build_chunks_for_document(doc: Dict[str, Any], start_chunk_id: int) -> List[
             clause_content = _normalize_spaces(cl.get('content') or '')
 
             if clause_content:
-                content = _compose_clause_text(art_num or '', clause_num or '', clause_content)
+                content = _compose_clause_text(
+                    art_num or '', clause_num or '', clause_content,
+                    chapter=art.get('chapter_title'), section=art.get('section_title'),
+                    article_heading=art_heading
+                )
                 content = normalize_for_db(content)
                 chunks.append({
                     'chunk_id': start_chunk_id + len(chunks),
@@ -179,7 +268,11 @@ def build_chunks_for_document(doc: Dict[str, Any], start_chunk_id: int) -> List[
                 pcontent = _normalize_spaces(pt.get('content') or '')
                 if not pcontent:
                     continue
-                content = _compose_point_text(art_num or '', clause_num or '', label or '', pcontent)
+                content = _compose_point_text(
+                    art_num or '', clause_num or '', label or '', pcontent,
+                    chapter=art.get('chapter_title'), section=art.get('section_title'),
+                    article_heading=art_heading
+                )
                 content = normalize_for_db(content)
                 chunks.append({
                     'chunk_id': start_chunk_id + len(chunks),

@@ -7,14 +7,22 @@ import os
 import sys
 sys.path.append('../..')
 
+from dotenv import load_dotenv
+load_dotenv() 
+
 import json
 from pathlib import Path
 from src.utils.paths import get_processed_data_dir, get_project_root
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from sentence_transformers import models as st_models
 import faiss
 from tqdm import tqdm
 import torch
+from dotenv import load_dotenv
+
+# Nạp biến môi trường từ .env (nếu có)
+load_dotenv()
 
 def load_document_chunks():
     """Load document chunks.
@@ -75,9 +83,14 @@ def load_document_chunks():
     print(f"📊 Tổng số chunks: {len(chunks)}")
 
     # Lấy nội dung chunks và ids ổn định
-    # ViTokenizer có thể tạo dấu '_' nối từ; chuẩn hóa về khoảng trắng để cải thiện embedding
+    # Giữ '_' theo ENV để bảo toàn cụm từ ghép của PyVi khi embedding
+    keep_underscore = os.getenv("LEGALADVISOR_EMB_KEEP_UNDERSCORE", "1").lower() in ("1", "true", "yes", "on")
+
     def normalize_for_embedding(text: str) -> str:
-        return (text or '').replace('_', ' ').strip()
+        _t = (text or '').strip()
+        if keep_underscore:
+            return _t
+        return _t.replace('_', ' ')
 
     # Giảm kích thước bằng cách cắt content input embedding (ví dụ 800 tokens ~ 4k chars)
     texts = [normalize_for_embedding((chunk.get('content', '') or '')[:4000]) for chunk in chunks]
@@ -116,8 +129,36 @@ def create_embeddings(texts, model_name="sentence-transformers/paraphrase-multil
     else:
         device = "cpu"
 
+    # Cho phép override model qua ENV
+    env_model = os.getenv("LEGALADVISOR_EMB_MODEL")
+    if env_model:
+        model_name = env_model
+
     print(f"🖥️  Device: {device}")
-    model = SentenceTransformer(model_name, device=device)
+    print(f"🧠 Embedding model: {model_name}")
+
+    # Ưu tiên CLS pooling cho Sup-SimCSE nếu phát hiện model tương ứng hoặc ENV yêu cầu
+    force_cls = os.getenv("LEGALADVISOR_EMB_POOLING", "").lower() == "cls"
+    try_cls = ("sup-simcse" in model_name.lower()) or force_cls
+
+    if try_cls:
+        try:
+            transformer = st_models.Transformer(model_name)
+            pooling = st_models.Pooling(
+                transformer.get_word_embedding_dimension(),
+                pooling_mode_cls_token=True,
+                pooling_mode_mean_tokens=False,
+                pooling_mode_max_tokens=False,
+            )
+            model = SentenceTransformer(modules=[transformer, pooling], device=device)
+            print("🔧 Pooling: CLS (theo Sup-SimCSE)")
+        except Exception as e:
+            print(f"ℹ️  Không thể khởi tạo CLS pooling ({e}). Dùng mặc định của SentenceTransformers (mean)")
+            model = SentenceTransformer(model_name, device=device)
+            print("🔧 Pooling: mean (mặc định)")
+    else:
+        model = SentenceTransformer(model_name, device=device)
+        print("🔧 Pooling: mean (mặc định)")
 
     print("🔄 Tạo embeddings...")
 
@@ -141,6 +182,7 @@ def build_faiss_index(embeddings, ids=None):
     """Build FAISS index từ embeddings.
 
     Nếu cung cấp ids (chunk_id), sẽ sử dụng IndexIDMap để ánh xạ ổn định.
+    Hỗ trợ HNSW qua ENV LEGALADVISOR_FAISS_HNSW=1.
     """
 
     print("🏗️ Xây dựng FAISS index...")
@@ -148,15 +190,37 @@ def build_faiss_index(embeddings, ids=None):
     # Lấy dimension của embeddings
     dimension = embeddings.shape[1]
 
-    # Tạo FAISS index với Inner Product (cho cosine similarity)
-    base_index = faiss.IndexFlatIP(dimension)
-
-    # Normalize embeddings cho cosine similarity
+    # Normalize embeddings để dùng cosine trên hình cầu đơn vị
     faiss.normalize_L2(embeddings)
 
-    # Add vectors
+    use_hnsw = os.getenv("LEGALADVISOR_FAISS_HNSW", "0").lower() in ("1", "true", "yes", "on")
+    metric_type = "ip"
+
+    if use_hnsw:
+        M = int(os.getenv("LEGALADVISOR_HNSW_M", "32"))
+        try:
+            # Thử tạo HNSW với Inner Product (nếu bản FAISS hỗ trợ)
+            base_index = faiss.IndexHNSWFlat(dimension, M, faiss.METRIC_INNER_PRODUCT)  # type: ignore
+            metric_type = "hnsw_ip"
+        except Exception:
+            # Fallback: HNSW L2
+            base_index = faiss.IndexHNSWFlat(dimension, M)
+            metric_type = "hnsw_l2"
+        # Thiết lập tham số tìm kiếm/xây dựng
+        try:
+            efc = int(os.getenv("LEGALADVISOR_HNSW_EF_CONSTRUCTION", "200"))
+            efs = int(os.getenv("LEGALADVISOR_HNSW_EF_SEARCH", "64"))
+            base_index.hnsw.efConstruction = efc
+            base_index.hnsw.efSearch = efs
+        except Exception:
+            pass
+    else:
+        # Dùng IndexFlatIP cho cosine similarity
+        base_index = faiss.IndexFlatIP(dimension)
+        metric_type = "ip"
+
+    # Add vectors (bọc IDMap nếu có ids)
     if ids is not None:
-        # Bọc với IDMap và add kèm ids (int64)
         index = faiss.IndexIDMap(base_index)
         ids_array = np.asarray(ids, dtype=np.int64)
         index.add_with_ids(embeddings, ids_array)
@@ -164,11 +228,11 @@ def build_faiss_index(embeddings, ids=None):
         index = base_index
         index.add(embeddings)
 
-    print(f"✅ FAISS index created with {index.ntotal} vectors")
+    print(f"✅ FAISS index created with {index.ntotal} vectors | type={metric_type}")
 
-    return index
+    return index, metric_type
 
-def save_index_and_metadata(index, metadata, model, output_dir="../models/retrieval", used_id_map=True):
+def save_index_and_metadata(index, metadata, model, output_dir="../models/retrieval", used_id_map=True, metric_type: str = "ip"):
     """Lưu FAISS index và metadata"""
 
     # Luôn lưu về thư mục models/retrieval tại gốc dự án
@@ -188,11 +252,29 @@ def save_index_and_metadata(index, metadata, model, output_dir="../models/retrie
     print(f"💾 Metadata saved: {metadata_path}")
 
     # Lưu model info
+    # Thêm thông tin pooling để launcher hiển thị
+    pooling = "mean"
+    try:
+        for m in getattr(model, 'modules', []):
+            cls_name = m.__class__.__name__.lower()
+            if 'pooling' in cls_name:
+                if getattr(m, 'pooling_mode_cls_token', False):
+                    pooling = 'cls'
+                elif getattr(m, 'pooling_mode_mean_tokens', False):
+                    pooling = 'mean'
+                elif getattr(m, 'pooling_mode_max_tokens', False):
+                    pooling = 'max'
+                break
+    except Exception:
+        pass
+
     model_info = {
-        "model_name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "model_name": getattr(model, "model_card", {}).get("name", None) or getattr(model, "_model_card", None) or os.getenv("LEGALADVISOR_EMB_MODEL") or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         "embedding_dim": index.d,
         "num_chunks": index.ntotal,
-        "uses_id_map": bool(used_id_map)
+        "uses_id_map": bool(used_id_map),
+        "metric_type": metric_type,
+        "pooling": pooling
     }
 
     model_info_path = output_dir / "model_info.json"
@@ -215,10 +297,10 @@ def main():
     embeddings, model = create_embeddings(texts)
 
     # Build FAISS index
-    index = build_faiss_index(embeddings, ids=ids)
+    index, metric_type = build_faiss_index(embeddings, ids=ids)
 
     # Lưu index và metadata
-    save_index_and_metadata(index, metadata, model, used_id_map=True)
+    save_index_and_metadata(index, metadata, model, used_id_map=True, metric_type=metric_type)
 
     print("\n✅ Hoàn thành tạo FAISS index!")
     print("📁 Các file được lưu tại: ../models/retrieval/")

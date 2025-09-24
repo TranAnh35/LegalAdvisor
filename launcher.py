@@ -10,6 +10,7 @@ import subprocess
 import time
 from pathlib import Path
 from dotenv import load_dotenv
+import json
 
 def check_requirements():
     """Kiểm tra các yêu cầu cơ bản"""
@@ -58,13 +59,32 @@ def check_requirements():
             missing_datasets.append(file_path)
 
     if missing_datasets:
-        print("⚠️ Thiếu datasets:")
+        print("ℹ️  Một số datasets chưa có (không bắt buộc để chạy launcher):")
         for missing in missing_datasets:
             print(f"   - {missing}")
-        print("💡 Chạy preprocessing để tạo datasets:")
-        print("   python src/automatic_preprocess_vnlegaltext_stable.py  # tạo smart_chunks_stable.db/parquet")
-        print("   python src/download_viquad.py")
-        print("   python src/split_datasets.py")
+        print("   → Có thể tạo riêng khi cần.")
+
+    # Kiểm tra mô hình retrieval đã sẵn sàng chưa
+    retrieval_dir = Path("models/retrieval")
+    index_path = retrieval_dir / "faiss_index.bin"
+    meta_path = retrieval_dir / "metadata.json"
+    info_path = retrieval_dir / "model_info.json"
+    if not retrieval_dir.exists() or not index_path.exists() or not meta_path.exists() or not info_path.exists():
+        print("⚠️  Thiếu mô hình retrieval (FAISS/metadata/model_info).")
+        print("   💡 Vui lòng chạy riêng bước build index trước khi launch:")
+        print("      conda activate LegalAdvisor")
+        print("      python src/retrieval/build_index.py")
+    else:
+        try:
+            with open(info_path, 'r', encoding='utf-8') as f:
+                mi = json.load(f)
+            model_name = mi.get('model_name')
+            dim = mi.get('embedding_dim')
+            metric = mi.get('metric_type', 'ip')
+            pooling = mi.get('pooling', 'unknown')
+            print(f"🔧 Retrieval model: {model_name} | dim={dim} | metric={metric} | pooling={pooling}")
+        except Exception:
+            print("ℹ️  Không đọc được model_info.json để hiển thị thông tin mô hình.")
 
     print("✅ Kiểm tra hoàn thành!")
     return True
@@ -108,6 +128,8 @@ def start_api_server(use_gpu=False):
         if not env.get("GOOGLE_API_KEY"):
             raise RuntimeError("GOOGLE_API_KEY chưa được thiết lập. Vui lòng tạo .env và đặt GOOGLE_API_KEY.")
         env["RAG_ENGINE"] = "gemini"
+        # Truyền hint sử dụng GPU cho các tiến trình con
+        env["LEGALADVISOR_USE_GPU"] = "1" if use_gpu else "0"
         api_process = subprocess.Popen(cmd, env=env)
         print("✅ API server đã khởi động (PID: {})".format(api_process.pid))
 
@@ -132,7 +154,8 @@ def start_ui_server():
             "--server.headless", "true"
         ]
 
-        ui_process = subprocess.Popen(cmd)
+        env = os.environ.copy()
+        ui_process = subprocess.Popen(cmd, env=env)
         print("✅ UI server đã khởi động (PID: {})".format(ui_process.pid))
 
     except Exception as e:
@@ -180,6 +203,11 @@ def signal_handler(signum, frame):
 
 def main():
     """Hàm chính"""
+    # Nạp .env sớm để các ENV như GOOGLE_API_KEY/LEGALADVISOR_* có hiệu lực
+    try:
+        load_dotenv()
+    except Exception:
+        pass
     print("\n" + "="*50)
     print("   🏛️  LegalAdvisor - Hệ thống hỗ trợ pháp lý")
     print("   🚀 Phiên bản: 2.0 (Gemini Integration)")
@@ -226,6 +254,7 @@ def main():
             if api_process and api_process.poll() is not None:
                 print("❌ API server đã dừng trong quá trình khởi động. Vui lòng xem logs hiển thị từ API.")
                 print("💡 Gợi ý: kiểm tra GOOGLE_API_KEY, thư mục models/retrieval và kết nối internet.")
+                print("   → Nếu cần xây lại index: python src/retrieval/build_index.py")
                 sys.exit(1)
 
             try:
@@ -243,6 +272,7 @@ def main():
             if elapsed >= max_wait_seconds:
                 print("❌ Không thể kết nối API trong 60 giây.")
                 print("💡 Gợi ý: kiểm tra GOOGLE_API_KEY, thư mục models/retrieval và logs của API.")
+                print("   → Nếu thiếu index: python src/retrieval/build_index.py")
                 break
             time.sleep(1)
 

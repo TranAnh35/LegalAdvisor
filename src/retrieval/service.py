@@ -71,14 +71,33 @@ class RetrievalService:
         return query_embedding
 
     def retrieve(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        """Truy hồi tài liệu liên quan cho truy vấn."""
+        """Truy hồi tài liệu liên quan cho truy vấn (semantic + boost theo Điều/Khoản/Điểm nếu có)."""
         try:
+            # Semantic search
             query_embedding = self.encode_query(query)
 
-            k = min(int(top_k or 3), int(self.index.ntotal))
+            k = min(int(max(top_k, 3)), int(self.index.ntotal))
             if k <= 0:
                 return []
             distances, indices = self.index.search(query_embedding, k)
+
+            # Boost theo match số điều/khoản/điểm trong query nếu có
+            import re
+            article_num = None
+            clause_num = None
+            point_label = None
+            try:
+                m = re.search(r"\bĐiều\s+(\d+)\b", query, flags=re.IGNORECASE)
+                if m:
+                    article_num = m.group(1)
+                m = re.search(r"\bKhoản\s+(\d+)\b", query, flags=re.IGNORECASE)
+                if m:
+                    clause_num = m.group(1)
+                m = re.search(r"\bĐiểm\s*\(?([a-z])\)?\b", query, flags=re.IGNORECASE)
+                if m:
+                    point_label = m.group(1)
+            except Exception:
+                pass
 
             results: List[Dict[str, Any]] = []
             for i, (distance, idx) in enumerate(zip(distances[0], indices[0])):
@@ -86,6 +105,18 @@ class RetrievalService:
                     continue
                 chunk_id = int(idx)
                 meta = self._meta_by_id.get(chunk_id, {})
+
+                # Áp dụng boost nhẹ nếu phù hợp Điều/Khoản/Điểm
+                boosted_score = float(distance)
+                try:
+                    if article_num and str(meta.get('article')) == str(article_num):
+                        boosted_score += 0.06
+                    if clause_num and str(meta.get('clause')) == str(clause_num):
+                        boosted_score += 0.04
+                    if point_label and str(meta.get('point')) == str(point_label):
+                        boosted_score += 0.03
+                except Exception:
+                    pass
 
                 content = self.get_chunk_content(chunk_id) or meta.get('preview', '')
 
@@ -112,14 +143,16 @@ class RetrievalService:
                     'content': content or '',
                     'preview': meta.get('preview', ''),
                     'source': meta.get('source', 'Nguồn không xác định'),
-                    'score': float(distance),
+                    'score': float(boosted_score),
                     'law_title': meta.get('doc_title'),
                     'article': meta.get('article'),
                     'clause': meta.get('clause'),
                     'point': meta.get('point')
                 })
 
-            return results
+            # Sắp xếp lại theo boosted score giảm dần
+            results.sort(key=lambda r: r.get('score', 0.0), reverse=True)
+            return results[:k]
         except Exception:
             return []
 

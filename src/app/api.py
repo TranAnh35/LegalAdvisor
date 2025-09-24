@@ -8,7 +8,7 @@ import os
 import signal
 sys.path.append('../..')
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
@@ -16,7 +16,9 @@ import uvicorn
 from pathlib import Path
 import json
 import time
-import torch
+import threading
+from collections import defaultdict, deque
+from datetime import datetime
 
 # Import logger
 try:
@@ -35,8 +37,6 @@ except ImportError:
         logger.error(message)
 
 # Import RAG pipeline - Sử dụng GeminiRAG
-import sys
-import os
 import argparse
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -49,18 +49,93 @@ args, unknown = parser.parse_known_args()
 
 # Initialize RAG system: luôn dùng GeminiRAG (lazy init để tăng tốc khởi động)
 rag_system = None
+rag_last_error: Optional[str] = None
+rag_init_lock = threading.Lock()
+rag_retry_info: Dict[str, Any] = {
+    "attempts": 0,
+    "last_attempt_at": None,
+    "last_success_at": None,
+    "last_error": None,
+}
+
+# Rate limiting (cấu hình qua ENV)
+RATE_LIMIT_WINDOW = int(os.getenv("LEGALADVISOR_RATE_LIMIT_WINDOW", "60"))
+RATE_LIMIT_MAX = int(os.getenv("LEGALADVISOR_RATE_LIMIT_MAX", "30"))
+_rate_limit_store: Dict[str, deque] = defaultdict(deque)
+_rate_limit_lock = threading.Lock()
+
+# Cho phép bỏ qua khởi tạo RAG (phục vụ test)
+SKIP_RAG_INIT = os.getenv("LEGALADVISOR_SKIP_RAG_INIT", "0") == "1"
+
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def _init_rag(force: bool = False) -> bool:
+    """Khởi tạo RAG và cập nhật trạng thái toàn cục."""
+    global rag_system, rag_last_error
+
+    with rag_init_lock:
+        if rag_system is not None and not force:
+            return True
+
+        rag_retry_info["attempts"] = int(rag_retry_info.get("attempts", 0)) + 1
+        rag_retry_info["last_attempt_at"] = _now_iso()
+
+        try:
+            from rag.gemini_rag import GeminiRAG
+            rag_system = GeminiRAG(use_gpu=args.use_gpu)
+            rag_last_error = None
+            rag_retry_info["last_success_at"] = rag_retry_info["last_attempt_at"]
+            rag_retry_info["last_error"] = None
+            print("🤖 Đã khởi tạo GeminiRAG thành công!")
+            logger.info("GeminiRAG initialized successfully")
+            return True
+        except Exception as e:
+            error_msg = f"Failed to initialize GeminiRAG: {e}"
+            rag_system = None
+            rag_last_error = str(e)
+            rag_retry_info["last_error"] = str(e)
+            log_error(error_msg)
+            print(f"❌ {error_msg}")
+            return False
+
 
 def _init_rag_background():
-    global rag_system
-    try:
-        from rag.gemini_rag import GeminiRAG
-        rag_system = GeminiRAG(use_gpu=args.use_gpu)
-        print("🤖 Đã khởi tạo GeminiRAG thành công (lazy)!")
-    except Exception as e:
-        print(f"❌ Lỗi khi khởi tạo GeminiRAG (lazy): {str(e)}")
+    """Khởi tạo RAG với retry nền."""
+    max_retries = 3
+    delay_seconds = 5
+    for attempt in range(1, max_retries + 1):
+        if _init_rag():
+            return
+        if attempt < max_retries:
+            logger.warning(
+                f"Retrying GeminiRAG initialization in {delay_seconds}s (attempt {attempt}/{max_retries})"
+            )
+            time.sleep(delay_seconds)
+    logger.error("GeminiRAG failed to initialize after retries")
 
-import threading
-threading.Thread(target=_init_rag_background, daemon=True).start()
+
+if not SKIP_RAG_INIT:
+    threading.Thread(target=_init_rag_background, daemon=True).start()
+else:
+    logger.info("Skipping GeminiRAG background init (LEGALADVISOR_SKIP_RAG_INIT=1)")
+
+# Pydantic models
+class QuestionRequest(BaseModel):
+    question: str
+    top_k: Optional[int] = 3
+
+
+class AnswerResponse(BaseModel):
+    question: str
+    answer: str
+    confidence: float
+    sources: List[Dict[str, Any]]
+    num_sources: int
+    status: str
+
 
 # Khởi tạo FastAPI
 app = FastAPI(
@@ -78,23 +153,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic models
-class QuestionRequest(BaseModel):
-    question: str
-    top_k: Optional[int] = 3
-
-class AnswerResponse(BaseModel):
-    question: str
-    answer: str
-    confidence: float
-    sources: List[Dict[str, Any]]
-    num_sources: int
-    status: str
-
 class HealthResponse(BaseModel):
     status: str
     message: str
     rag_loaded: bool
+    rag_error: Optional[str] = None
+
+class HealthDiagnostics(BaseModel):
+    rag_loaded: bool
+    rag_error: Optional[str]
+    retry_attempts: int
+    last_attempt_at: Optional[str]
+    last_success_at: Optional[str]
+
 
 @app.get("/", tags=["General"])
 async def root():
@@ -109,25 +180,89 @@ async def root():
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
     """Kiểm tra trạng thái hệ thống"""
+    status = "healthy" if rag_system else "degraded"
     return HealthResponse(
-        status="healthy" if rag_system else "degraded",
+        status=status,
         message="LegalAdvisor API is running",
-        rag_loaded=rag_system is not None
+        rag_loaded=rag_system is not None,
+        rag_error=rag_last_error
     )
 
+@app.get("/health/details", response_model=HealthDiagnostics, tags=["Health"], summary="Chi tiết trạng thái RAG")
+async def health_details():
+    """Trả về thông tin chi tiết về trạng thái RAG."""
+    return HealthDiagnostics(
+        rag_loaded=rag_system is not None,
+        rag_error=rag_last_error,
+        retry_attempts=int(rag_retry_info.get("attempts", 0)),
+        last_attempt_at=rag_retry_info.get("last_attempt_at"),
+        last_success_at=rag_retry_info.get("last_success_at")
+    )
+
+@app.post("/debug/reinit", response_model=HealthResponse, tags=["Health"], summary="Force reinitialize RAG")
+async def force_reinitialize_rag():
+    """Ép khởi tạo lại hệ thống RAG."""
+    success = _init_rag(force=True)
+    status = "healthy" if success else "degraded"
+    return HealthResponse(
+        status=status,
+        message="RAG reinitialized" if success else "Failed to reinitialize RAG",
+        rag_loaded=rag_system is not None,
+        rag_error=rag_last_error
+    )
+
+
+def _rate_limit_cleanup(timestamps: deque, now: float) -> None:
+    while timestamps and now - timestamps[0] > RATE_LIMIT_WINDOW:
+        timestamps.popleft()
+
+
+async def rate_limit_dependency(request: Request) -> None:
+    if RATE_LIMIT_MAX <= 0:
+        return
+
+    client_host = request.client.host if request.client else "unknown"
+    now = time.time()
+
+    with _rate_limit_lock:
+        timestamps = _rate_limit_store[client_host]
+        _rate_limit_cleanup(timestamps, now)
+
+        if len(timestamps) >= RATE_LIMIT_MAX:
+            retry_after = max(0.0, RATE_LIMIT_WINDOW - (now - timestamps[0]))
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "message": "Rate limit exceeded",
+                    "retry_after": round(retry_after, 2),
+                    "limit_window": RATE_LIMIT_WINDOW,
+                    "limit_max": RATE_LIMIT_MAX
+                }
+            )
+
+        timestamps.append(now)
+
+
 @app.post("/ask", response_model=AnswerResponse, tags=["QA"])
-async def ask_question(request: QuestionRequest):
+async def ask_question(request: QuestionRequest, _: None = Depends(rate_limit_dependency)):
     """Trả lời câu hỏi pháp luật"""
 
     logger.info(f"Received question: {request.question}")
     start_time = time.time()
 
-    if not rag_system:
-        log_error("RAG system not available")
-        raise HTTPException(
-            status_code=503,
-            detail="RAG system is not available. Please check the system logs."
-        )
+    if rag_system is None:
+        if _init_rag():
+            logger.info("GeminiRAG reinitialized on-demand")
+        else:
+            log_error("RAG system not available")
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": "RAG system is not available",
+                    "error": rag_last_error,
+                    "hint": "Verify GOOGLE_API_KEY and retrieval models are configured."
+                }
+            )
 
     try:
         # Xử lý câu hỏi
@@ -155,7 +290,10 @@ async def ask_question(request: QuestionRequest):
         log_error(f"Error processing question '{request.question}': {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error processing question: {str(e)}"
+            detail={
+                "message": "Error processing question",
+                "error": str(e)
+            }
         )
 
 @app.get("/stats", tags=["Statistics"])

@@ -28,7 +28,11 @@ genai.configure(api_key=GOOGLE_API_KEY)
 GEMINI_MODEL = "gemini-2.0-flash-exp"
 
 def format_retrieved_docs(docs: List[Dict[str, Any]]) -> str:
-    """Format retrieved documents với tên luật + điều/khoản/điểm và tóm tắt ngắn."""
+    """Format retrieved documents với tên luật + điều/khoản/điểm và tóm tắt ngắn.
+
+    - Giữ nguyên dấu '_' trong content để khớp embedding, nhưng chỉ khi không ảnh hưởng đọc hiểu.
+    - Tăng snippet lên 600 ký tự để cung cấp ngữ cảnh đầy đủ hơn.
+    """
     formatted_docs: List[str] = []
     for i, doc in enumerate(docs, 1):
         law_title = doc.get('law_title') or doc.get('title') or doc.get('doc_file')
@@ -44,9 +48,10 @@ def format_retrieved_docs(docs: List[Dict[str, Any]]) -> str:
             labels.append(f"Điểm {point}")
         label_str = ' - '.join(labels)
 
-        content = (doc.get('content') or '').replace('_', ' ').strip()
-        snippet = content[:400]
-        suffix = '...' if len(content) > 400 else ''
+        content = (doc.get('content') or '').strip()
+        # Hiển thị thân thiện: thay '_' bằng ' ' chỉ trong phần snippet để dễ đọc
+        snippet = content[:600].replace('_', ' ')
+        suffix = '...' if len(content) > 600 else ''
 
         formatted_docs.append(
             f"[Nguồn {i}] {law_title}{(' - ' + label_str) if label_str else ''}\n{snippet}{suffix}\n(điểm: {doc.get('score', 0):.2f})"
@@ -84,8 +89,8 @@ class GeminiRAG:
         try:
             # Initialize the Gemini model
             generation_config = {
-                "temperature": 0.2,  # Lower temperature for more focused answers
-                "top_p": 0.95,
+                "temperature": 0.1,  # thấp hơn để giảm suy diễn
+                "top_p": 0.9,
                 "top_k": 40,
                 "max_output_tokens": 2048,
             }
@@ -143,18 +148,15 @@ class GeminiRAG:
             # Prepare the prompt
             if context:
                 prompt = f"""
-                Bạn là trợ lý pháp lý. Dựa trên ngữ cảnh trích dẫn từ các bộ luật dưới đây,
-                hãy trả lời ngắn gọn, súc tích, dễ đọc dưới dạng gạch đầu dòng, kèm điều/khoản/điểm liên quan.
+                Bạn là trợ lý pháp lý tiếng Việt. Hãy trả lời ngắn gọn, chính xác dựa TRỰC TIẾP vào ngữ cảnh bên dưới.
+                - BẮT BUỘC trích dẫn cụ thể theo định dạng: (Tên luật – Điều X[, Khoản Y[, Điểm Z]]).
+                - Không suy diễn ngoài phạm vi ngữ cảnh. Nếu ngữ cảnh chưa đủ, nói rõ điều đó và gợi ý điều/khoản cần xem.
+                - Trình bày dạng gạch đầu dòng, tối đa 3-5 ý; dùng ngôn ngữ phổ thông, dễ hiểu.
 
                 Ngữ cảnh (đã trích nguồn):
                 {context}
 
                 Câu hỏi: {question}
-
-                Yêu cầu:
-                - Tổng hợp ý chính (tối đa 3-5 gạch đầu dòng), tránh lặp lại nguyên văn dài dòng.
-                - Trích dẫn nguồn theo dạng: (Tên luật – Điều X[, Khoản Y[, Điểm Z]]).
-                - Nếu không đủ thông tin, nêu rõ cần tham khảo thêm điều nào.
                 """
             else:
                 prompt = f"""
@@ -189,11 +191,12 @@ class GeminiRAG:
             # Step 3: Generate response using Gemini
             answer = self.generate_response(question, context)
 
-            # Bổ sung phần "Nguồn tham khảo" kèm Điều/Khoản/Điểm (đảm bảo luôn có trong câu trả lời)
+            # Bổ sung: chỉ "Tài liệu tham khảo" theo format (Luật ? - Điều ? - Khoản ? - Điểm ?)
             if retrieved_docs:
-                lines = []
+                ref_lines = []
                 for i, d in enumerate(retrieved_docs, 1):
-                    law_title = d.get('law_title') or d.get('title') or d.get('doc_file')
+                    law_title_raw = d.get('law_title') or d.get('title') or d.get('doc_file') or ''
+                    law_title = str(law_title_raw).replace('_', ' ').strip()
                     parts = []
                     if d.get('article'):
                         parts.append(f"Điều {d.get('article')}")
@@ -201,13 +204,14 @@ class GeminiRAG:
                         parts.append(f"Khoản {d.get('clause')}")
                     if d.get('point'):
                         parts.append(f"Điểm {d.get('point')}")
-                    label = ' – '.join(parts)
-                    if label:
-                        lines.append(f"{i}. {law_title} – {label}")
+                    label_str = ' - '.join(parts)
+                    if label_str:
+                        ref_lines.append(f"{i}. ({law_title} - {label_str})")
                     else:
-                        lines.append(f"{i}. {law_title}")
-                citations_block = "\n".join(lines)
-                answer = f"{answer}\n\nNguồn tham khảo:\n{citations_block}"
+                        ref_lines.append(f"{i}. ({law_title})")
+
+                citations_block = "\n".join(ref_lines)
+                answer = f"{answer}\n\nTài liệu tham khảo:\n{citations_block}"
             
             # Prepare response
             response = {

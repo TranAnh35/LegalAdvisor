@@ -108,14 +108,18 @@ class StableVNLegalTextProcessor:
             return ""
 
         try:
-            # Xóa các tag XML nhưng thay bằng khoảng trắng để tránh dính từ
+            # Chuẩn hóa xuống dòng Windows về \n
+            text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+            # Xóa các tag XML nhưng cố gắng giữ cấu trúc dòng (thay bằng xuống dòng nếu có khối lớn)
             text = re.sub(r'<[^>]+>', ' ', text)
 
-            # Chuẩn hóa khoảng trắng nhưng giữ lại cấu trúc dòng
+            # Chuẩn hóa khoảng trắng nhưng GIỮ lại dấu xuống dòng
             text = re.sub(r'[ \t]+', ' ', text)
-            # Chèn khoảng trắng trước khi tokenize để tránh dính từ cạnh dấu câu
+            # Chèn khoảng trắng trước khi tokenize để tránh dính từ cạnh dấu câu (không ảnh hưởng \n)
             text = re.sub(r'([,;:\.!?)(\[\]"\'])', r' \1 ', text)
-            text = re.sub(r'\s+', ' ', text)
+            # KHÔNG gộp \n: bỏ dòng sau để bảo toàn cấu trúc
+            # text = re.sub(r'\s+', ' ', text)
 
             # Sử dụng pyvi để tách từ tự động - BẮT BUỘC
             text = ViTokenizer.tokenize(text)
