@@ -10,7 +10,7 @@ sys.path.append('../..')
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, conint, constr
 from typing import List, Dict, Any, Optional
 import uvicorn
 from pathlib import Path
@@ -22,7 +22,7 @@ from datetime import datetime
 
 # Import logger
 try:
-    from utils.logger import get_logger, log_performance, log_error
+    from ..utils.logger import get_logger, log_performance, log_error
     logger = get_logger("legaladvisor.api")
 except ImportError:
     # Fallback if utils not available
@@ -64,6 +64,13 @@ RATE_LIMIT_MAX = int(os.getenv("LEGALADVISOR_RATE_LIMIT_MAX", "30"))
 _rate_limit_store: Dict[str, deque] = defaultdict(deque)
 _rate_limit_lock = threading.Lock()
 
+# Toggle log nội dung câu hỏi (0/1)
+LOG_QUESTIONS = os.getenv("LEGALADVISOR_LOG_QUESTIONS", "0") == "1"
+
+# Sweep dọn dẹp rate-limit store định kỳ (0/1)
+ENABLE_RATE_LIMIT_CLEANUP = os.getenv("LEGALADVISOR_RATE_LIMIT_CLEANUP", "1") == "1"
+RATE_LIMIT_SWEEP_INTERVAL = int(os.getenv("LEGALADVISOR_RATE_LIMIT_SWEEP_INTERVAL", "60"))
+
 # Cho phép bỏ qua khởi tạo RAG (phục vụ test)
 SKIP_RAG_INIT = os.getenv("LEGALADVISOR_SKIP_RAG_INIT", "0") == "1"
 
@@ -84,7 +91,7 @@ def _init_rag(force: bool = False) -> bool:
         rag_retry_info["last_attempt_at"] = _now_iso()
 
         try:
-            from rag.gemini_rag import GeminiRAG
+            from ..rag.gemini_rag import GeminiRAG
             rag_system = GeminiRAG(use_gpu=args.use_gpu)
             rag_last_error = None
             rag_retry_info["last_success_at"] = rag_retry_info["last_attempt_at"]
@@ -122,10 +129,16 @@ if not SKIP_RAG_INIT:
 else:
     logger.info("Skipping GeminiRAG background init (LEGALADVISOR_SKIP_RAG_INIT=1)")
 
+# Khởi động thread dọn dẹp rate-limit nếu bật
+if False:
+    pass
+
 # Pydantic models
 class QuestionRequest(BaseModel):
-    question: str
-    top_k: Optional[int] = 3
+    # Giới hạn chiều dài câu hỏi để tránh lạm dụng (mặc định 1024)
+    question: constr(min_length=1, max_length=1024)  # type: ignore
+    # Ràng buộc top_k trong khoảng 1..50
+    top_k: conint(ge=1, le=50) = 3  # type: ignore
 
 
 class AnswerResponse(BaseModel):
@@ -217,6 +230,35 @@ def _rate_limit_cleanup(timestamps: deque, now: float) -> None:
         timestamps.popleft()
 
 
+def _sanitize_sensitive(text: Optional[str]) -> Optional[str]:
+    """Mask thông tin nhạy cảm (ví dụ API key) nếu có xuất hiện trong chuỗi."""
+    if not text:
+        return text
+    masked = str(text)
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if api_key:
+        masked = masked.replace(api_key, "***")
+    return masked
+
+
+def _rate_limit_sweeper():
+    """Thread nền: dọn dẹp các key IP không còn timestamp hợp lệ để tránh leak bộ nhớ."""
+    while True:
+        try:
+            now = time.time()
+            with _rate_limit_lock:
+                to_delete = []
+                for ip, timestamps in _rate_limit_store.items():
+                    _rate_limit_cleanup(timestamps, now)
+                    if not timestamps:
+                        to_delete.append(ip)
+                for ip in to_delete:
+                    del _rate_limit_store[ip]
+        except Exception as e:
+            logger.warning(f"Rate limit sweeper error: {e}")
+        time.sleep(RATE_LIMIT_SWEEP_INTERVAL)
+
+
 async def rate_limit_dependency(request: Request) -> None:
     if RATE_LIMIT_MAX <= 0:
         return
@@ -247,7 +289,10 @@ async def rate_limit_dependency(request: Request) -> None:
 async def ask_question(request: QuestionRequest, _: None = Depends(rate_limit_dependency)):
     """Trả lời câu hỏi pháp luật"""
 
-    logger.info(f"Received question: {request.question}")
+    if LOG_QUESTIONS:
+        logger.info(f"Received question: {request.question}")
+    else:
+        logger.info("Received question: [masked]")
     start_time = time.time()
 
     if rag_system is None:
@@ -259,7 +304,7 @@ async def ask_question(request: QuestionRequest, _: None = Depends(rate_limit_de
                 status_code=503,
                 detail={
                     "message": "RAG system is not available",
-                    "error": rag_last_error,
+                    "error": _sanitize_sensitive(rag_last_error),
                     "hint": "Verify GOOGLE_API_KEY and retrieval models are configured."
                 }
             )
@@ -271,7 +316,7 @@ async def ask_question(request: QuestionRequest, _: None = Depends(rate_limit_de
 
         response_time = time.time() - start_time
         log_performance("api_request", response_time, {
-            "question": request.question,
+            "question": request.question if LOG_QUESTIONS else "[masked]",
             "confidence": float(result.get('confidence', 0.0)),
             "num_sources": int(result.get('num_sources', 0))
         })
@@ -287,12 +332,13 @@ async def ask_question(request: QuestionRequest, _: None = Depends(rate_limit_de
         )
 
     except Exception as e:
-        log_error(f"Error processing question '{request.question}': {str(e)}")
+        safe_err = _sanitize_sensitive(str(e))
+        log_error(f"Error processing question: {safe_err}")
         raise HTTPException(
             status_code=500,
             detail={
                 "message": "Error processing question",
-                "error": str(e)
+                "error": safe_err
             }
         )
 
@@ -405,3 +451,11 @@ def run_server(host="0.0.0.0", port=8000, reload=False):
 if __name__ == "__main__":
     # Chạy server với cấu hình đã parse ở đầu file
     run_server(host=args.host, port=args.port, reload=False)
+
+# Khởi động thread dọn dẹp rate-limit (đặt ở cuối để đảm bảo hàm đã được định nghĩa)
+if ENABLE_RATE_LIMIT_CLEANUP:
+    try:
+        threading.Thread(target=_rate_limit_sweeper, daemon=True).start()
+        logger.info("Rate limit sweeper thread started")
+    except Exception as e:
+        logger.warning(f"Cannot start rate limit sweeper: {e}")

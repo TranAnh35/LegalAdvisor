@@ -45,12 +45,10 @@ def check_requirements():
             Path(dir_path).mkdir(parents=True, exist_ok=True)
             print(f"✅ Đã tạo thư mục: {dir_path}")
 
-    # Kiểm tra dataset
+    # Kiểm tra dataset (ưu tiên pipeline mới Zalo-Legal)
     dataset_files = [
-        # Chuẩn: dữ liệu đã xử lý ở SQLite/Parquet
-        "data/processed/smart_chunks_stable.db",
-        "data/processed/smart_chunks_stable.parquet",
-        "data/raw/ViQuAD/train.json"
+        # Dữ liệu đã tiền xử lý cho pipeline mới
+        "data/processed/zalo-legal/chunks_schema.jsonl"
     ]
 
     missing_datasets = []
@@ -59,10 +57,10 @@ def check_requirements():
             missing_datasets.append(file_path)
 
     if missing_datasets:
-        print("ℹ️  Một số datasets chưa có (không bắt buộc để chạy launcher):")
+        print("ℹ️  Chưa tìm thấy dữ liệu đã tiền xử lý cho pipeline Zalo-Legal:")
         for missing in missing_datasets:
             print(f"   - {missing}")
-        print("   → Có thể tạo riêng khi cần.")
+        print("   → Hãy chạy: python scripts/zalo_legal_preprocess.py (sau khi đã download)")
 
     # Kiểm tra mô hình retrieval đã sẵn sàng chưa
     retrieval_dir = Path("models/retrieval")

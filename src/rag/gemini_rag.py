@@ -10,51 +10,64 @@ import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-import google.generativeai as genai
 from dotenv import load_dotenv
-from retrieval.service import RetrievalService
+from ..retrieval.service import RetrievalService
 
-# Load environment variables
-load_dotenv()
-
-# Configure Gemini
-GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
-if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY not found in environment variables")
-
-genai.configure(api_key=GOOGLE_API_KEY)
-
-# Initialize Gemini model
+# Do NOT initialize google.generativeai at import time.
+# Gemini (google-generativeai) will be imported and configured lazily
+# inside GeminiRAG._initialize_gemini() to avoid raising on module import
+# when GOOGLE_API_KEY is not present (improves testability and CI).
 GEMINI_MODEL = "gemini-2.0-flash-exp"
+
+def _vietnamese_doc_title(type_code: str, number: str) -> str:
+    """Chuyển type+number thành tên văn bản thân thiện.
+    Ví dụ: ttlt-bca-btp-vksndtc-tandtc + 13/2012 ->
+    "Thông tư liên tịch 13/2012/TTLT-BCA-BTP-VKSNDTC-TANDTC"
+    """
+    if not type_code:
+        return number or "Văn bản pháp luật"
+    code = (type_code or '').lower()
+    code_upper = (type_code or '').upper()
+    mapping = {
+        'nđ-cp': 'Nghị định',
+        'nd-cp': 'Nghị định',
+        'tt': 'Thông tư',
+        'tt-bca': 'Thông tư',
+        'tt-byt': 'Thông tư',
+        'ttlt': 'Thông tư liên tịch',
+        'ttlt-bca-btp-vksndtc-tandtc': 'Thông tư liên tịch',
+        'qđ-ttg': 'Quyết định',
+        'qd-ttg': 'Quyết định',
+        'lh': 'Luật',
+        'qh': 'Luật',
+    }
+    vn_type = mapping.get(code, code_upper)
+    return f"{vn_type} {number}/{code_upper}"
 
 def format_retrieved_docs(docs: List[Dict[str, Any]]) -> str:
     """Format retrieved documents với tên luật + điều/khoản/điểm và tóm tắt ngắn.
 
     - Giữ nguyên dấu '_' trong content để khớp embedding, nhưng chỉ khi không ảnh hưởng đọc hiểu.
-    - Tăng snippet lên 600 ký tự để cung cấp ngữ cảnh đầy đủ hơn.
+    - Tăng snippet lên 1200 ký tự để cung cấp ngữ cảnh đầy đủ hơn.
     """
     formatted_docs: List[str] = []
     for i, doc in enumerate(docs, 1):
-        law_title = doc.get('law_title') or doc.get('title') or doc.get('doc_file')
-        article = doc.get('article')
-        clause = doc.get('clause')
-        point = doc.get('point')
-        labels = []
-        if article:
-            labels.append(f"Điều {article}")
-        if clause:
-            labels.append(f"Khoản {clause}")
-        if point:
-            labels.append(f"Điểm {point}")
-        label_str = ' - '.join(labels)
+        corpus_id = doc.get('corpus_id') or ''
+        type_code = doc.get('type') or ''
+        number = doc.get('number') or ''
+        year = doc.get('year') or ''
+        suffix = doc.get('suffix') or ''
+        dieu = f"Điều {suffix}" if str(suffix).isdigit() else ''
+
+        law_title = _vietnamese_doc_title(type_code, number)
 
         content = (doc.get('content') or '').strip()
         # Hiển thị thân thiện: thay '_' bằng ' ' chỉ trong phần snippet để dễ đọc
-        snippet = content[:600].replace('_', ' ')
-        suffix = '...' if len(content) > 600 else ''
+        snippet = content[:1200].replace('_', ' ')
+        suffix = '...' if len(content) > 1200 else ''
 
         formatted_docs.append(
-            f"[Nguồn {i}] {law_title}{(' - ' + label_str) if label_str else ''}\n{snippet}{suffix}\n(điểm: {doc.get('score', 0):.2f})"
+            f"[Nguồn {i}] {law_title}{(' - ' + dieu) if dieu else ''} — `{corpus_id}`\n{snippet}{suffix}\n(điểm: {doc.get('score', 0):.2f})"
         )
     return "\n\n".join(formatted_docs)
 
@@ -87,6 +100,19 @@ class GeminiRAG:
     def _initialize_gemini(self):
         """Initialize the Gemini model"""
         try:
+            # Load env and require API key at runtime (not at import time)
+            load_dotenv()
+            google_api_key = os.getenv('GOOGLE_API_KEY')
+            if not google_api_key:
+                raise RuntimeError("GOOGLE_API_KEY not found in environment variables")
+
+            # Import and configure google.generativeai lazily so importing this
+            # module (or running tests that mock RAG) does not fail when the key
+            # is not set.
+            import google.generativeai as genai  # imported here intentionally
+
+            genai.configure(api_key=google_api_key)
+
             # Initialize the Gemini model
             generation_config = {
                 "temperature": 0.1,  # thấp hơn để giảm suy diễn
@@ -94,7 +120,7 @@ class GeminiRAG:
                 "top_k": 40,
                 "max_output_tokens": 2048,
             }
-            
+
             safety_settings = [
                 {
                     "category": "HARM_CATEGORY_HARASSMENT",
@@ -113,7 +139,7 @@ class GeminiRAG:
                     "threshold": "BLOCK_NONE"
                 },
             ]
-            
+
             self.model = genai.GenerativeModel(
                 model_name=GEMINI_MODEL,
                 generation_config=generation_config,
@@ -145,15 +171,26 @@ class GeminiRAG:
     def generate_response(self, question: str, context: str = None, **kwargs) -> str:
         """Generate a response using Gemini"""
         try:
+            # Ensure Gemini model is initialized at call-time. This allows
+            # importing the module (e.g., in tests) without GOOGLE_API_KEY set.
+            if not getattr(self, 'model', None):
+                try:
+                    self._initialize_gemini()
+                except Exception as e:
+                    # Fail gracefully: return an informative message rather than
+                    # raising at import or runtime in user-facing paths.
+                    print(f"Error initializing Gemini: {e}")
+                    return "Xin lỗi, hệ thống chưa cấu hình mô hình ngôn ngữ. Vui lòng thiết lập GOOGLE_API_KEY."
+
             # Prepare the prompt
             if context:
                 prompt = f"""
-                Bạn là trợ lý pháp lý tiếng Việt. Hãy trả lời ngắn gọn, chính xác dựa TRỰC TIẾP vào ngữ cảnh bên dưới.
-                - BẮT BUỘC trích dẫn cụ thể theo định dạng: (Tên luật – Điều X[, Khoản Y[, Điểm Z]]).
-                - Không suy diễn ngoài phạm vi ngữ cảnh. Nếu ngữ cảnh chưa đủ, nói rõ điều đó và gợi ý điều/khoản cần xem.
-                - Trình bày dạng gạch đầu dòng, tối đa 3-5 ý; dùng ngôn ngữ phổ thông, dễ hiểu.
+                Bạn là trợ lý pháp lý tiếng Việt. Trả lời CHỈ dựa vào ngữ cảnh sau.
+                - KHÔNG chèn mã nguồn hay corpus-id vào phần trả lời. KHÔNG dùng ngoặc đơn để liệt kê mã nguồn.
+                - Hạn chế suy diễn. Chỉ khi ngữ cảnh không nêu quy định trực tiếp mới nói "Không đủ căn cứ trong nguồn đã trích" và gợi ý văn bản cần tra thêm.
+                - Câu trả lời ngắn gọn, 3-5 gạch đầu dòng, dùng ngôn ngữ tự nhiên, dễ hiểu.
 
-                Ngữ cảnh (đã trích nguồn):
+                Ngữ cảnh (đã kèm corpus-id):
                 {context}
 
                 Câu hỏi: {question}
@@ -169,7 +206,7 @@ class GeminiRAG:
             
             # Generate response
             response = self.model.generate_content(prompt)
-            
+
             # Return the generated text
             return response.text
             
@@ -191,27 +228,7 @@ class GeminiRAG:
             # Step 3: Generate response using Gemini
             answer = self.generate_response(question, context)
 
-            # Bổ sung: chỉ "Tài liệu tham khảo" theo format (Luật ? - Điều ? - Khoản ? - Điểm ?)
-            if retrieved_docs:
-                ref_lines = []
-                for i, d in enumerate(retrieved_docs, 1):
-                    law_title_raw = d.get('law_title') or d.get('title') or d.get('doc_file') or ''
-                    law_title = str(law_title_raw).replace('_', ' ').strip()
-                    parts = []
-                    if d.get('article'):
-                        parts.append(f"Điều {d.get('article')}")
-                    if d.get('clause'):
-                        parts.append(f"Khoản {d.get('clause')}")
-                    if d.get('point'):
-                        parts.append(f"Điểm {d.get('point')}")
-                    label_str = ' - '.join(parts)
-                    if label_str:
-                        ref_lines.append(f"{i}. ({law_title} - {label_str})")
-                    else:
-                        ref_lines.append(f"{i}. ({law_title})")
-
-                citations_block = "\n".join(ref_lines)
-                answer = f"{answer}\n\nTài liệu tham khảo:\n{citations_block}"
+            # Không thêm block tham khảo vào câu trả lời để tránh trùng với UI. UI sẽ hiển thị sources.
             
             # Prepare response
             response = {
@@ -261,7 +278,10 @@ def test_gemini_rag():
         
         print(f"\n🔍 Nguồn tham khảo ({response['num_sources']}):")
         for i, source in enumerate(response['sources'], 1):
-            print(f"{i}. {source['title']} (Điểm: {source['score']:.2f})")
+            # Tránh KeyError: metadata hiện không có 'title'
+            corpus_id = source.get('corpus_id') or '(không có corpus_id)'
+            score = source.get('score', 0.0)
+            print(f"{i}. {corpus_id} (Điểm: {score:.2f})")
         
         print("\n✅ Test completed successfully!")
         

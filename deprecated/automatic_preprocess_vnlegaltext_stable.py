@@ -18,7 +18,7 @@ import sqlite3
 import argparse
 
 # Sinh smart chunks trực tiếp không qua JSON
-from export_chunks_storage import build_chunks_for_document
+from tmp.export_chunks_storage import build_chunks_for_document
 
 # Import PyVi
 try:
@@ -423,6 +423,89 @@ class StableVNLegalTextProcessor:
                 'error_type': type(e).__name__
             }
 
+    def process_record(self, record: Dict[str, Any], record_id: Optional[str] = None) -> Dict[str, Any]:
+        """Xử lý một record từ JSON/JSONL/Parquet (GreenNode corpus).
+
+        Gắng map các trường phổ biến như 'text', 'content', 'body' vào raw_content.
+        record_id dùng làm file_name giả để theo dõi nguồn.
+        """
+        try:
+            # Lấy raw text từ các trường phổ biến
+            raw_content = None
+            for key in ('text', 'content', 'body', 'passage', 'document'):
+                if key in record and record.get(key):
+                    raw_content = record.get(key)
+                    break
+
+            # Nếu không có, thử ghép các trường mô tả
+            if raw_content is None:
+                candidates = []
+                for k, v in record.items():
+                    if isinstance(v, str) and len(v) > 50:
+                        candidates.append(v)
+                raw_content = '\n'.join(candidates) if candidates else ''
+
+            raw_content = raw_content or ''
+
+            # Giới hạn kích thước record để tránh OOM
+            if len(raw_content) > 10 * 1024 * 1024:
+                return {
+                    'file_name': record_id or 'record',
+                    'file_path': record_id or 'record',
+                    'error': 'Record too large (>10MB)',
+                    'error_type': 'record_too_large'
+                }
+
+            cleaned_for_index = self.clean_text_with_vietnamese_support(
+                raw_content,
+                remove_stopwords=False,
+                keep_underscore=True
+            )
+            cleaned_for_ui = None
+            if not self.fast:
+                cleaned_for_ui = self.clean_text_with_vietnamese_support(
+                    raw_content,
+                    remove_stopwords=True,
+                    keep_underscore=False
+                )
+
+            metadata = self.extract_title_and_metadata(cleaned_for_index, raw_text=raw_content)
+            document_title = metadata.get('title', record_id or 'record')
+            sections = self.parse_legal_structure(cleaned_for_index, document_title)
+
+            result = {
+                'file_name': record_id or str(record.get('id') or 'record'),
+                'file_path': str(record.get('id') or record_id or 'record'),
+                'metadata': metadata,
+                'cleaned_content': cleaned_for_index,
+                'cleaned_content_index': cleaned_for_index,
+                'cleaned_content_ui': cleaned_for_ui if cleaned_for_ui is not None else '',
+                'sections': sections,
+                'stats': {} if self.fast else {
+                    'total_sections': len(sections),
+                    'articles_count': len([s for s in sections if s['section_type'] == 'article']),
+                    'clauses_count': len([s for s in sections if s['section_type'] == 'clause']),
+                    'points_count': len([s for s in sections if s['section_type'] == 'point']),
+                    'total_words': len(cleaned_for_index.split())
+                },
+                'processing_info': {
+                    'used_pyvi': True,
+                    'stopwords_removed_for_index': False,
+                    'stopwords_removed_for_ui': (cleaned_for_ui is not None),
+                    'processing_time': time.time(),
+                    'record_size': len(raw_content)
+                }
+            }
+
+            return result
+        except Exception as e:
+            return {
+                'file_name': record_id or str(record.get('id') or 'record'),
+                'file_path': record_id or str(record.get('id') or 'record'),
+                'error': str(e),
+                'error_type': type(e).__name__
+            }
+
     def process_all_files_stable(self, input_dir: Path, output_path: Path, batch_size: int = 50, skip_parquet: bool = False):
         """Xử lý tất cả files và xuất thẳng smart chunks vào SQLite/Parquet, không tạo JSON tổng."""
         # Tạo thư mục output
@@ -492,16 +575,32 @@ class StableVNLegalTextProcessor:
 
         total_chunks = 0
 
-        # Lấy danh sách file XML
-        xml_files = list(input_dir.glob("*.xml"))
+        # Hỗ trợ đầu vào là thư mục chứa XML hoặc một file JSONL/Parquet tập hợp documents
+        xml_files = []
+        is_jsonl_input = False
+        if input_dir.is_file():
+            # Nếu là JSONL (ví dụ GreenNode corpus.jsonl) hoặc Parquet
+            if input_dir.suffix.lower() in ('.jsonl', '.json'):
+                is_jsonl_input = True
+                print(f"📁 Input là file JSONL: {input_dir}")
+            elif input_dir.suffix.lower() in ('.parquet', '.pq'):
+                is_jsonl_input = True
+                print(f"📁 Input là file Parquet: {input_dir}")
+            else:
+                print(f"❌ Input file không hỗ trợ: {input_dir}")
+                conn.close()
+                return
+        else:
+            xml_files = list(input_dir.glob("*.xml"))
 
-        if not xml_files:
+        if not is_jsonl_input and not xml_files:
             print(f"❌ Không tìm thấy file XML nào trong {input_dir}")
             # Đóng kết nối nếu đã mở
             conn.close()
             return
 
-        print(f"📁 Tìm thấy {len(xml_files)} file XML")
+        if not is_jsonl_input:
+            print(f"📁 Tìm thấy {len(xml_files)} file XML")
         print(f"🤖 Sử dụng xử lý ổn định: PyVi {'Có' if HAS_PYVI else 'Không'}")
         print(f"📊 Batch size: {batch_size} files")
 
@@ -510,103 +609,216 @@ class StableVNLegalTextProcessor:
         total_processed = 0
 
         remaining_files = xml_files
-        print(f"🔄 Bắt đầu xử lý {len(xml_files)} files")
-
-        if not remaining_files:
-            print("✅ Tất cả files đã được xử lý!")
-            return
-
-        # Xử lý theo batch
-        # Bắt đầu đếm từ 0
-        # total_processed đã được khởi tạo ở trên
-
-        with tqdm(total=len(remaining_files), desc="Processing XML files", unit="file") as pbar:
-            for i in range(0, len(remaining_files), batch_size):
-                batch = remaining_files[i:i + batch_size]
-
-                for xml_file in batch:
-                    try:
-                        result = self.process_single_file(xml_file)
-
-                        # Cập nhật progress
-                        total_processed += 1
-                        pbar.update(1)
-
-                        # Bỏ qua file lỗi
-                        if 'error' in result:
-                            continue
-
-                        # Xây smart chunks cho tài liệu này
-                        doc_chunks = build_chunks_for_document(result, start_chunk_id=total_chunks)
-
-                        # Chuẩn hóa và chèn vào SQLite
-                        rows = []
-                        for ch in doc_chunks:
-                            chunk_id = to_int(ch.get('chunk_id'))
-                            doc_file = to_text(ch.get('doc_file'))
-                            # Rút gọn doc_title để giảm size: cắt tối đa 200 ký tự
-                            _title = to_text(ch.get('doc_title'))
-                            doc_title = (_title[:200] if _title and len(_title) > 200 else _title)
-                            chapter = to_text(ch.get('chapter'))
-                            section = to_text(ch.get('section'))
-                            article = to_text(ch.get('article'))
-                            article_heading = to_text(ch.get('article_heading'))
-                            clause = to_text(ch.get('clause'))
-                            point = to_text(ch.get('point'))
-                            chunk_index = to_int(ch.get('chunk_index'))
-                            # Nén content nhẹ: bỏ khoảng trắng thừa
-                            _content = to_text(ch.get('content'))
+        # Nếu input là JSONL/Parquet, xử lý theo luồng đọc từng record
+        if is_jsonl_input:
+            # Đọc file JSONL từng dòng (nhẹ bộ nhớ)
+            print(f"🔄 Bắt đầu xử lý JSONL/Parquet: {input_dir}")
+            pbar = None
+            try:
+                if input_dir.suffix.lower() in ('.parquet', '.pq'):
+                    import pandas as pd  # type: ignore
+                    df = pd.read_parquet(input_dir)
+                    total = len(df)
+                    from tqdm import tqdm as _tqdm
+                    for idx, row in _tqdm(df.iterrows(), total=total, desc="Processing records"):
+                        try:
+                            record = dict(row)
+                            # Compose a pseudo file name
+                            file_name = str(record.get('id') or record.get('doc_id') or f"rec_{idx}")
+                            result = self.process_record(record, record_id=file_name)
+                            total_processed += 1
+                            if 'error' in result:
+                                continue
+                            # For corpus records: create exactly ONE chunk per record (do not further split)
+                            rows = []
+                            # Normalize content: prefer cleaned_for_index
+                            _content = to_text(result.get('cleaned_content_index') or result.get('cleaned_content') or '')
                             content = ' '.join(_content.split()) if _content else None
-                            word_count = ch.get('word_count')
-                            if word_count is None and content is not None:
-                                word_count = len(content.split())
-                            word_count = to_int(word_count)
-                            chunk_type = to_text(ch.get('chunk_type'))
-
+                            doc_file = to_text(result.get('file_name'))
+                            _title = to_text((result.get('metadata') or {}).get('title'))
+                            doc_title = (_title[:200] if _title and len(_title) > 200 else _title)
+                            chunk_id = total_chunks
+                            chunk_index = 0
+                            word_count = len(content.split()) if content else 0
+                            chunk_type = 'corpus_record'
                             rows.append((
-                                chunk_id,
+                                to_int(chunk_id),
                                 doc_file,
                                 doc_title,
-                                chapter,
-                                section,
-                                article,
-                                article_heading,
-                                clause,
-                                point,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
                                 chunk_index,
                                 content,
-                                word_count,
+                                to_int(word_count),
                                 chunk_type,
                             ))
+                            if rows:
+                                cur.executemany(
+                                    'INSERT INTO chunks (chunk_id, doc_file, doc_title, chapter, section, article, article_heading, clause, point, chunk_index, content, word_count, chunk_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                    rows
+                                )
+                                total_chunks += len(rows)
+                                if total_chunks % 5000 == 0:
+                                    conn.commit()
+                        except Exception as e:
+                            print(f"❌ Lỗi xử lý record {idx}: {e}")
+                    conn.commit()
+                else:
+                    # JSONL
+                    with open(input_dir, 'r', encoding='utf-8') as jf:
+                        from tqdm import tqdm as _tqdm
+                        # Ước tính tổng dòng không khả thi nhanh, dùng tqdm đơn giản
+                        for idx, line in enumerate(_tqdm(jf, desc="Processing JSONL lines")):
+                            try:
+                                import json as _json
+                                record = _json.loads(line)
+                                file_name = str(record.get('id') or record.get('doc_id') or f"rec_{idx}")
+                                result = self.process_record(record, record_id=file_name)
+                                total_processed += 1
+                                if 'error' in result:
+                                    continue
+                                # For corpus records: create exactly ONE chunk per record (do not further split)
+                                rows = []
+                                _content = to_text(result.get('cleaned_content_index') or result.get('cleaned_content') or '')
+                                content = ' '.join(_content.split()) if _content else None
+                                doc_file = to_text(result.get('file_name'))
+                                _title = to_text((result.get('metadata') or {}).get('title'))
+                                doc_title = (_title[:200] if _title and len(_title) > 200 else _title)
+                                chunk_id = total_chunks
+                                chunk_index = 0
+                                word_count = len(content.split()) if content else 0
+                                chunk_type = 'corpus_record'
+                                rows.append((
+                                    to_int(chunk_id),
+                                    doc_file,
+                                    doc_title,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    chunk_index,
+                                    content,
+                                    to_int(word_count),
+                                    chunk_type,
+                                ))
+                                if rows:
+                                    cur.executemany(
+                                        'INSERT INTO chunks (chunk_id, doc_file, doc_title, chapter, section, article, article_heading, clause, point, chunk_index, content, word_count, chunk_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                        rows
+                                    )
+                                    total_chunks += len(rows)
+                                    if total_chunks % 5000 == 0:
+                                        conn.commit()
+                            except Exception as e:
+                                print(f"❌ Lỗi xử lý JSONL dòng {idx}: {e}")
+                    conn.commit()
+            finally:
+                print(f"💾 Đã commit, tổng processed: {total_processed}, tổng chunks: {total_chunks}")
+        else:
+            remaining_files = xml_files
+            print(f"🔄 Bắt đầu xử lý {len(xml_files)} files")
 
-                        if rows:
-                            cur.executemany(
-                                'INSERT INTO chunks (chunk_id, doc_file, doc_title, chapter, section, article, article_heading, clause, point, chunk_index, content, word_count, chunk_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                                rows
-                            )
-                            total_chunks += len(rows)
-                            # Commit định kỳ để an toàn
-                            if total_chunks % 5000 == 0:
-                                conn.commit()
+            if not remaining_files:
+                print("✅ Tất cả files đã được xử lý!")
+                return
 
-                        # Hiển thị status mỗi 10 files
-                        if total_processed % 10 == 0:
-                            elapsed_time = time.time() - start_time
-                            files_per_second = total_processed / elapsed_time if elapsed_time > 0 else 0
-                            pbar.set_postfix({
-                                'processed': f"{total_processed}/{len(xml_files)}",
-                                'speed': f"{files_per_second:.1f} files/s",
-                                'chunks': f"{total_chunks:,}"
-                            })
+            # Xử lý theo batch
+            # Bắt đầu đếm từ 0
+            # total_processed đã được khởi tạo ở trên
 
-                    except Exception as e:
-                        print(f"❌ Lỗi xử lý {xml_file.name}: {e}")
-                        total_processed += 1
-                        pbar.update(1)
+            with tqdm(total=len(remaining_files), desc="Processing XML files", unit="file") as pbar:
+                for i in range(0, len(remaining_files), batch_size):
+                    batch = remaining_files[i:i + batch_size]
 
-                # Commit mỗi batch
-                conn.commit()
-                print(f"💾 Đã commit sau {total_processed} files, tổng chunks: {total_chunks:,}")
+                    for xml_file in batch:
+                        try:
+                            result = self.process_single_file(xml_file)
+
+                            # Cập nhật progress
+                            total_processed += 1
+                            pbar.update(1)
+
+                            # Bỏ qua file lỗi
+                            if 'error' in result:
+                                continue
+
+                            # Xây smart chunks cho tài liệu này
+                            doc_chunks = build_chunks_for_document(result, start_chunk_id=total_chunks)
+
+                            # Chuẩn hóa và chèn vào SQLite
+                            rows = []
+                            for ch in doc_chunks:
+                                chunk_id = to_int(ch.get('chunk_id'))
+                                doc_file = to_text(ch.get('doc_file'))
+                                # Rút gọn doc_title để giảm size: cắt tối đa 200 ký tự
+                                _title = to_text(ch.get('doc_title'))
+                                doc_title = (_title[:200] if _title and len(_title) > 200 else _title)
+                                chapter = to_text(ch.get('chapter'))
+                                section = to_text(ch.get('section'))
+                                article = to_text(ch.get('article'))
+                                article_heading = to_text(ch.get('article_heading'))
+                                clause = to_text(ch.get('clause'))
+                                point = to_text(ch.get('point'))
+                                chunk_index = to_int(ch.get('chunk_index'))
+                                # Nén content nhẹ: bỏ khoảng trắng thừa
+                                _content = to_text(ch.get('content'))
+                                content = ' '.join(_content.split()) if _content else None
+                                word_count = ch.get('word_count')
+                                if word_count is None and content is not None:
+                                    word_count = len(content.split())
+                                word_count = to_int(word_count)
+                                chunk_type = to_text(ch.get('chunk_type'))
+
+                                rows.append((
+                                    chunk_id,
+                                    doc_file,
+                                    doc_title,
+                                    chapter,
+                                    section,
+                                    article,
+                                    article_heading,
+                                    clause,
+                                    point,
+                                    chunk_index,
+                                    content,
+                                    word_count,
+                                    chunk_type,
+                                ))
+
+                            if rows:
+                                cur.executemany(
+                                    'INSERT INTO chunks (chunk_id, doc_file, doc_title, chapter, section, article, article_heading, clause, point, chunk_index, content, word_count, chunk_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                    rows
+                                )
+                                total_chunks += len(rows)
+                                # Commit định kỳ để an toàn
+                                if total_chunks % 5000 == 0:
+                                    conn.commit()
+
+                            # Hiển thị status mỗi 10 files
+                            if total_processed % 10 == 0:
+                                elapsed_time = time.time() - start_time
+                                files_per_second = total_processed / elapsed_time if elapsed_time > 0 else 0
+                                pbar.set_postfix({
+                                    'processed': f"{total_processed}/{len(xml_files)}",
+                                    'speed': f"{files_per_second:.1f} files/s",
+                                    'chunks': f"{total_chunks:,}"
+                                })
+
+                        except Exception as e:
+                            print(f"❌ Lỗi xử lý {xml_file.name}: {e}")
+                            total_processed += 1
+                            pbar.update(1)
+
+                    # Commit mỗi batch
+                    conn.commit()
+                    print(f"💾 Đã commit sau {total_processed} files, tổng chunks: {total_chunks:,}")
 
         # Hoàn tất SQLite
         conn.commit()
@@ -655,6 +867,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=100, help='Số file xử lý mỗi batch (mặc định: 100)')
     parser.add_argument('--skip-parquet', action='store_true', help='Bỏ qua bước xuất Parquet để tăng tốc')
     parser.add_argument('--fast', action='store_true', help='Chế độ nhanh: bỏ cleaned_for_ui và thống kê')
+    parser.add_argument('--input', type=str, default=None, help='Đường dẫn input: thư mục XML hoặc file corpus.jsonl / parquet (mặc định: data/raw/VNLegalText)')
     args = parser.parse_args()
 
     try:
@@ -671,14 +884,21 @@ def main():
 
     # Đường dẫn
     root = get_project_root()
-    vnlegal_path = root / "data" / "raw" / "VNLegalText"
+    # Nếu user cung cấp --input, dùng đường dẫn đó (có thể là file hoặc thư mục)
+    if args.input:
+        input_path = Path(args.input)
+        if not input_path.is_absolute():
+            input_path = root / args.input
+    else:
+        input_path = root / "data" / "raw" / "VNLegalText"
+
     # Giữ biến output_path cho tương thích, nhưng không xuất JSON nữa
     output_path = root / "data" / "processed" / "vnlegaltext_stable.json"
 
     # Cấu hình batch size
     batch_size = int(args.batch_size)
 
-    print(f"📂 Input: {vnlegal_path}")
+    print(f"📂 Input: {input_path}")
     print(f"📂 Output (DB/Parquet sẽ nằm cùng thư mục): {output_path.parent}")
     print(f"🔢 Batch size: {batch_size}")
     if args.fast:
@@ -688,7 +908,7 @@ def main():
     print("📋 Xử lý: PyVi + Stopwords removal (BẮT BUỘC)")
     print()
 
-    processor.process_all_files_stable(vnlegal_path, output_path, batch_size, skip_parquet=args.skip_parquet)
+    processor.process_all_files_stable(input_path, output_path, batch_size, skip_parquet=args.skip_parquet)
 
 if __name__ == "__main__":
     main()

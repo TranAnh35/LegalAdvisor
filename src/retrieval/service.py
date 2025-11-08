@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-Dịch vụ truy hồi tài liệu thống nhất cho LegalAdvisor.
+Dịch vụ truy hồi tài liệu thống nhất cho LegalAdvisor (Zalo-Legal schema).
 
 - Load FAISS index + metadata từ models/retrieval
 - Mã hóa truy vấn bằng SentenceTransformer theo model trong model_info
-- Đọc nội dung chunk từ SQLite (ưu tiên) hoặc Parquet
-
-Có thể dùng chung cho các engine RAG khác nhau (Gemini, Local).
+- Trả về kết quả dạng corpus_id/type/number/year và preview (không còn đọc SQLite/Parquet)
 """
 
 from __future__ import annotations
@@ -21,11 +19,11 @@ import torch  # type: ignore
 
 from sentence_transformers import SentenceTransformer  # type: ignore
 
-from utils.paths import get_models_retrieval_dir, get_processed_data_dir
+from ..utils.paths import get_models_retrieval_dir, get_processed_data_dir
 
 
 class RetrievalService:
-    """Dịch vụ truy hồi tài liệu dựa trên FAISS + metadata + content store."""
+    """Dịch vụ truy hồi tài liệu dựa trên FAISS + metadata (Zalo-Legal)."""
 
     def __init__(self, use_gpu: bool = False) -> None:
         # Thư mục models/retrieval
@@ -53,13 +51,13 @@ class RetrievalService:
 
         # Khởi tạo encoder
         device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
-        self.encoder = SentenceTransformer(self.model_info["model_name"], device=device)
+        model_name = self.model_info.get("model_name") or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        self.encoder = SentenceTransformer(model_name, device=device)
 
-        # Content store
-        processed_dir = get_processed_data_dir()
-        self.sqlite_path: Path = processed_dir / "smart_chunks_stable.db"
-        self.parquet_path: Path = processed_dir / "smart_chunks_stable.parquet"
-        self._parquet_df = None
+        # Đường dẫn JSONL content store (schema mới)
+        self.processed_dir: Path = get_processed_data_dir()
+        self.jsonl_path: Path = self.processed_dir / "zalo-legal" / "chunks_schema.jsonl"
+        self._content_cache: Dict[int, str] = {}
 
     def encode_query(self, text: str) -> np.ndarray:
         """Mã hóa truy vấn thành numpy float32 contiguous và normalized."""
@@ -71,7 +69,7 @@ class RetrievalService:
         return query_embedding
 
     def retrieve(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        """Truy hồi tài liệu liên quan cho truy vấn (semantic + boost theo Điều/Khoản/Điểm nếu có)."""
+        """Truy hồi tài liệu liên quan cho truy vấn (semantic)."""
         try:
             # Semantic search
             query_embedding = self.encode_query(query)
@@ -81,24 +79,6 @@ class RetrievalService:
                 return []
             distances, indices = self.index.search(query_embedding, k)
 
-            # Boost theo match số điều/khoản/điểm trong query nếu có
-            import re
-            article_num = None
-            clause_num = None
-            point_label = None
-            try:
-                m = re.search(r"\bĐiều\s+(\d+)\b", query, flags=re.IGNORECASE)
-                if m:
-                    article_num = m.group(1)
-                m = re.search(r"\bKhoản\s+(\d+)\b", query, flags=re.IGNORECASE)
-                if m:
-                    clause_num = m.group(1)
-                m = re.search(r"\bĐiểm\s*\(?([a-z])\)?\b", query, flags=re.IGNORECASE)
-                if m:
-                    point_label = m.group(1)
-            except Exception:
-                pass
-
             results: List[Dict[str, Any]] = []
             for i, (distance, idx) in enumerate(zip(distances[0], indices[0])):
                 if int(idx) < 0:
@@ -106,84 +86,48 @@ class RetrievalService:
                 chunk_id = int(idx)
                 meta = self._meta_by_id.get(chunk_id, {})
 
-                # Áp dụng boost nhẹ nếu phù hợp Điều/Khoản/Điểm
-                boosted_score = float(distance)
-                try:
-                    if article_num and str(meta.get('article')) == str(article_num):
-                        boosted_score += 0.06
-                    if clause_num and str(meta.get('clause')) == str(clause_num):
-                        boosted_score += 0.04
-                    if point_label and str(meta.get('point')) == str(point_label):
-                        boosted_score += 0.03
-                except Exception:
-                    pass
-
-                content = self.get_chunk_content(chunk_id) or meta.get('preview', '')
-
-                # Tạo tiêu đề ưu tiên: Tên luật → Điều/Khoản/Điểm → heading
-                base_title = meta.get('doc_title') or meta.get('doc_file') or f'chunk_{chunk_id}.txt'
-                parts: List[str] = []
-                if meta.get('article'):
-                    parts.append(f"Điều {meta.get('article')}")
-                if meta.get('clause'):
-                    parts.append(f"Khoản {meta.get('clause')}")
-                if meta.get('point'):
-                    parts.append(f"Điểm {meta.get('point')}")
-                suffix = ' - '.join(parts)
-                title = f"{base_title} - {suffix}" if suffix else base_title
-                heading = meta.get('article_heading')
-                if heading:
-                    title = f"{title} - {heading}"
-
                 results.append({
                     'id': chunk_id,
                     'chunk_id': chunk_id,
-                    'doc_file': meta.get('doc_file', f'chunk_{chunk_id}.txt'),
-                    'title': title,
-                    'content': content or '',
+                    'corpus_id': meta.get('corpus_id'),
+                    'type': meta.get('type'),
+                    'number': meta.get('number'),
+                    'year': meta.get('year'),
+                    'suffix': meta.get('suffix'),
+                    'content': meta.get('preview', ''),  # dùng preview làm snippet
                     'preview': meta.get('preview', ''),
-                    'source': meta.get('source', 'Nguồn không xác định'),
-                    'score': float(boosted_score),
-                    'law_title': meta.get('doc_title'),
-                    'article': meta.get('article'),
-                    'clause': meta.get('clause'),
-                    'point': meta.get('point')
+                    'score': float(distance)
                 })
 
-            # Sắp xếp lại theo boosted score giảm dần
+            # Sắp xếp theo score giảm dần
             results.sort(key=lambda r: r.get('score', 0.0), reverse=True)
             return results[:k]
         except Exception:
             return []
 
     def get_chunk_content(self, chunk_id: int) -> Optional[str]:
-        """Lấy nội dung chunk theo ID từ SQLite hoặc Parquet."""
-        # SQLite ưu tiên
+        """Trả về nội dung chunk từ JSONL schema mới (cache theo ID)."""
         try:
-            if self.sqlite_path and self.sqlite_path.exists():
-                import sqlite3  # type: ignore
-                conn = sqlite3.connect(str(self.sqlite_path))
-                cur = conn.cursor()
-                cur.execute("SELECT content FROM chunks WHERE chunk_id=?", (int(chunk_id),))
-                row = cur.fetchone()
-                conn.close()
-                if row and row[0]:
-                    return row[0]
+            if chunk_id in self._content_cache:
+                return self._content_cache.get(chunk_id)
+            if not self.jsonl_path.exists():
+                return None
+            # Đọc tuần tự và cache lazy theo nhu cầu để tiết kiệm RAM
+            with open(self.jsonl_path, encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if int(obj.get('chunk_id', -1)) == int(chunk_id):
+                        content = obj.get('content') or ''
+                        self._content_cache[chunk_id] = content
+                        return content
+            return None
         except Exception:
-            pass
-
-        # Parquet fallback
-        try:
-            if self.parquet_path and self.parquet_path.exists():
-                import pandas as pd  # type: ignore
-                if self._parquet_df is None:
-                    self._parquet_df = pd.read_parquet(self.parquet_path)
-                df = self._parquet_df
-                match = df.loc[df['chunk_id'] == int(chunk_id), 'content']
-                if not match.empty:
-                    return str(match.iloc[0])
-        except Exception:
-            pass
-        return None
+            return None
 
 

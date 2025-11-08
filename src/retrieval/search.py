@@ -37,7 +37,8 @@ class LegalRetriever:
         # Rút gọn schema cho script test
         simplified = [{
             'chunk_id': r.get('chunk_id'),
-            'doc_file': r.get('doc_file'),
+            # metadata không có doc_file; dùng corpus_id thay thế
+            'corpus_id': self.service._meta_by_id.get(int(r.get('chunk_id', -1)), {}).get('corpus_id') if r.get('chunk_id') is not None else None,
             'chunk_index': self.service._meta_by_id.get(int(r.get('chunk_id', -1)), {}).get('chunk_index') if r.get('chunk_id') is not None else None,
             'score': r.get('score', 0.0),
             'word_count': self.service._meta_by_id.get(int(r.get('chunk_id', -1)), {}).get('word_count') if r.get('chunk_id') is not None else None
@@ -47,28 +48,8 @@ class LegalRetriever:
 
     def get_chunk_content(self, chunk_id):
         """Lấy nội dung chunk theo ID từ SQLite/Parquet"""
+        # Dùng service thống nhất (JSONL schema mới)
         return self.service.get_chunk_content(int(chunk_id))
-        try:
-            processed_dir = Path(__file__).resolve().parent.parent.parent / "data" / "processed"
-            sqlite_path = processed_dir / 'smart_chunks_stable.db'
-            parquet_path = processed_dir / 'smart_chunks_stable.parquet'
-
-            if sqlite_path.exists():
-                conn = sqlite3.connect(str(sqlite_path))
-                cur = conn.cursor()
-                cur.execute("SELECT content FROM chunks WHERE chunk_id=?", (int(chunk_id),))
-                row = cur.fetchone()
-                conn.close()
-                return row[0] if row and row[0] else None
-
-            if parquet_path.exists():
-                df = pd.read_parquet(parquet_path)
-                match = df.loc[df['chunk_id'] == int(chunk_id), 'content']
-                if not match.empty:
-                    return str(match.iloc[0])
-        except Exception:
-            return None
-        return None
 
 def test_retrieval():
     """Test retrieval system"""

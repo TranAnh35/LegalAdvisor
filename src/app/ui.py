@@ -34,6 +34,15 @@ if "source_contents" not in st.session_state:
     st.session_state["source_contents"] = {}
 if "source_errors" not in st.session_state:
     st.session_state["source_errors"] = {}
+if "last_result" not in st.session_state:
+    st.session_state["last_result"] = None
+if "prefetched_ids" not in st.session_state:
+    st.session_state["prefetched_ids"] = set()
+# Thêm biến trạng thái hiện nguồn nào đang mở
+if "active_source" not in st.session_state:
+    st.session_state["active_source"] = None
+if "auto_submit" not in st.session_state:
+    st.session_state["auto_submit"] = False
 
 def check_api_health(max_retries=3, timeout=5):
     """Kiểm tra trạng thái API với retry"""
@@ -157,13 +166,7 @@ def main():
                     f"🔁 Số lần thử: {health_details.get('retry_attempts', 0)}"
                 )
 
-        # Thống kê
-        stats = get_stats()
-        if stats and "error" not in stats:
-            st.subheader("📈 Thống kê")
-            st.metric("Tổng chunks", f"{stats.get('total_chunks', 0):,}")
-            st.metric("Tổng từ", f"{stats.get('total_words', 0):,}")
-            st.metric("Trung bình từ/chunk", f"{stats.get('avg_words_per_chunk', 0):.1f}")
+        # Ẩn thống kê chi tiết (không phù hợp người dùng cuối)
 
         st.markdown("---")
         st.markdown("### 🔗 Links")
@@ -197,82 +200,118 @@ def main():
         if submit_button and question.strip():
             with st.spinner("🔄 Đang xử lý câu hỏi..."):
                 result = ask_question(question.strip(), top_k)
+                st.session_state["last_result"] = result
+                # Prefetch nội dung tài liệu để lần bấm 'Xem tài liệu' không bị trễ
+                try:
+                    if result and result.get("ok") and result.get("sources"):
+                        for src in result["sources"]:
+                            cid = src.get("chunk_id")
+                            if cid is None:
+                                continue
+                            if cid in st.session_state["prefetched_ids"]:
+                                continue
+                            resp = requests.get(f"{API_BASE_URL}/sources/{cid}", timeout=3)
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                content = (data.get("content", "") or "").replace('_', ' ')
+                                st.session_state["source_contents"][cid] = content
+                                st.session_state["prefetched_ids"].add(cid)
+                except Exception:
+                    pass
 
-                if result is None:
-                    st.error("❌ Không thể gửi câu hỏi. Kiểm tra kết nối API.")
-                elif result.get("ok"):
-                    # Hiển thị kết quả
-                    st.success("✅ Đã tìm thấy câu trả lời!")
+        # Tự động submit nếu chọn câu hỏi mẫu
+        if st.session_state.get("auto_submit") and st.session_state.get("question_input", "").strip():
+            result = ask_question(st.session_state["question_input"].strip(), top_k)
+            st.session_state["last_result"] = result
+            # Prefetch nội dung tài liệu
+            try:
+                if result and result.get("ok") and result.get("sources"):
+                    for src in result["sources"]:
+                        cid = src.get("chunk_id")
+                        if cid is None:
+                            continue
+                        if cid in st.session_state["prefetched_ids"]:
+                            continue
+                        resp = requests.get(f"{API_BASE_URL}/sources/{cid}", timeout=3)
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            content = (data.get("content", "") or "").replace('_', ' ')
+                            st.session_state["source_contents"][cid] = content
+                            st.session_state["prefetched_ids"].add(cid)
+            except Exception:
+                pass
+            st.session_state["auto_submit"] = False
 
-                    # Answer
-                    st.subheader("💡 Câu trả lời")
-                    st.write(result.get("answer", "Không có câu trả lời"))
+        # Luôn hiển thị last_result nếu có, để tránh reset khi bấm nút khác
+        result = st.session_state.get("last_result")
+        if result is None:
+            pass
+        elif result.get("ok"):
+            # Hiển thị kết quả
+            st.success("✅ Đã tìm thấy câu trả lời!")
 
-                    # Confidence
-                    confidence = result.get("confidence", 0)
-                    st.metric("Độ tin cậy", f"{confidence:.3f}")
+            # Answer
+            st.subheader("💡 Câu trả lời")
+            st.write(result.get("answer", "Không có câu trả lời"))
 
-                    # Sources
-                    if result.get("sources"):
-                        st.subheader("📚 Nguồn tài liệu")
+            # Bỏ hiển thị độ tin cậy theo yêu cầu
 
-                        for i, source in enumerate(result["sources"], 1):
-                            # Tiêu đề thân thiện: thay '_' bằng khoảng trắng
-                            raw_title = source.get('title', source.get('doc_file', f'Nguồn {i}')) or f'Nguồn {i}'
-                            disp_title = str(raw_title).replace('_', ' ')
-                            chunk_id = source.get('chunk_id')
-                            button_key = f"source_btn_{chunk_id}"
-                            with st.expander(f"📄 Nguồn {i}: {disp_title}"):
-                                st.write(f"**Điểm số:** {source['score']:.4f}")
-                                st.write(f"**File:** {disp_title}")
+            # Sources: hiển thị tiêu đề gọn + nút xem nội dung theo nhu cầu
+            if result.get("sources"):
+                st.subheader("📚 Nguồn tài liệu")
+                for i, source in enumerate(result["sources"], 1):
+                    corpus_id = source.get('corpus_id') or f"Nguồn {i}"
+                    type_ = source.get('type') or ""
+                    number = source.get('number') or ""
+                    year = source.get('year') or ""
+                    suffix = source.get('suffix')
+                    dieu = f" - Điều {suffix}" if str(suffix or '').isdigit() else ""
+                    score = source.get('score')
+                    chunk_id = source.get('chunk_id')
 
-                                # Lấy nội dung chunk nếu cần
-                                if chunk_id is not None and st.button("Xem nội dung", key=button_key):
-                                    try:
-                                        chunk_response = requests.get(f"{API_BASE_URL}/sources/{chunk_id}")
-                                        if chunk_response.status_code == 200:
-                                            chunk_data = chunk_response.json()
-                                            content = (chunk_data.get("content", "Không có nội dung") or "").replace('_', ' ')
-                                            st.session_state["source_contents"][chunk_id] = content
-                                            st.session_state["source_errors"].pop(chunk_id, None)
-                                        else:
-                                            st.session_state["source_errors"][chunk_id] = f"Status: {chunk_response.status_code}"
-                                    except Exception as exc:
-                                        st.session_state["source_errors"][chunk_id] = str(exc)
+                    st.markdown(f"**[{i}]** `{corpus_id}` ({type_} - {number} - {year}{dieu})")
+                    if isinstance(score, (int, float)):
+                        st.caption(f"Điểm: {score:.4f}")
+                    # Nút: khi bấm thì chỉ mở/đóng đúng nguồn này, không gọi API (đã prefetch)
+                    label = "Ẩn nội dung" if st.session_state["active_source"] == chunk_id else "Xem nội dung tham khảo"
+                    if st.button(label, key=f"btn_{chunk_id}"):
+                        if st.session_state["active_source"] == chunk_id:
+                            st.session_state["active_source"] = None
+                        else:
+                            st.session_state["active_source"] = chunk_id
+                    # Chỉ hiện nội dung nếu được mở
+                    if st.session_state["active_source"] == chunk_id:
+                        content = st.session_state["source_contents"].get(chunk_id, "Không có nội dung")
+                        st.text_area(
+                            "Nội dung tài liệu:",
+                            content,
+                            height=200,
+                            disabled=True
+                        )
 
-                                if chunk_id is not None and chunk_id in st.session_state["source_contents"]:
-                                    st.text_area(
-                                        "Nội dung tài liệu:",
-                                        st.session_state["source_contents"][chunk_id],
-                                        height=200,
-                                        disabled=True
-                                    )
-                                elif chunk_id is not None and chunk_id in st.session_state["source_errors"]:
-                                    st.error(f"Không thể tải nội dung: {st.session_state['source_errors'][chunk_id]}")
+        else:
+            detail = result.get("detail") or result.get("message") or result.get("error")
+            if isinstance(detail, dict):
+                primary_msg = detail.get("message") or detail.get("error") or "Không thể xử lý câu hỏi."
+                hint = detail.get("hint")
+                retry_after = detail.get("retry_after") or detail.get("retry_after_seconds")
+            else:
+                primary_msg = detail or "Không thể xử lý câu hỏi."
+                hint = None
+                retry_after = None
 
-                else:
-                    detail = result.get("detail") or result.get("message") or result.get("error")
-                    if isinstance(detail, dict):
-                        primary_msg = detail.get("message") or detail.get("error") or "Không thể xử lý câu hỏi."
-                        hint = detail.get("hint")
-                        retry_after = detail.get("retry_after") or detail.get("retry_after_seconds")
-                    else:
-                        primary_msg = detail or "Không thể xử lý câu hỏi."
-                        hint = None
-                        retry_after = None
+            status_code = result.get("status_code")
+            if status_code == 429:
+                st.error(f"❌ {primary_msg}")
+                if retry_after:
+                    st.info(f"Vui lòng thử lại sau khoảng {retry_after} giây.")
+            else:
+                st.error(f"❌ {primary_msg}")
+            if hint:
+                st.info(f"💡 {hint}")
 
-                    status_code = result.get("status_code")
-                    if status_code == 429:
-                        st.error(f"❌ {primary_msg}")
-                        if retry_after:
-                            st.info(f"Vui lòng thử lại sau khoảng {retry_after} giây.")
-                    else:
-                        st.error(f"❌ {primary_msg}")
-                    if hint:
-                        st.info(f"💡 {hint}")
-
-                    with st.expander("Chi tiết lỗi"):
-                        st.json(result)
+            with st.expander("Chi tiết lỗi"):
+                st.json(result)
 
     with col2:
         st.subheader("📝 Câu hỏi mẫu")
@@ -288,11 +327,7 @@ def main():
         for q in sample_questions:
             if st.button(q, use_container_width=True, key=f"sample_{q}"):
                 st.session_state["question_input"] = q
-                st.session_state["selected_sample"] = q
-
-        # Copy từ session state
-        if st.session_state.get("selected_sample"):
-            st.text_area("Câu hỏi được chọn:", st.session_state["selected_sample"], disabled=True)
+                st.session_state["auto_submit"] = True
 
     # Footer
     st.markdown("---")

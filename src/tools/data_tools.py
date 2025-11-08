@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 from typing import List
 
-from utils.paths import get_project_root, get_processed_data_dir
+from ..utils.paths import get_project_root, get_processed_data_dir
 
 
 def cmd_download_viquad() -> bool:
