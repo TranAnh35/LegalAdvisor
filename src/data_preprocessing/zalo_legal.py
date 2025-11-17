@@ -33,6 +33,9 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from tqdm import tqdm
 
+# Define project root for reliable path resolution
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
 
 def parse_corpus_id(corpus_id: str) -> Tuple[str, str, str, str]:
     """
@@ -181,27 +184,17 @@ def preprocess_corpus(
     Returns:
         Tuple of (output_file_path, num_chunks)
     """
-    # Set default paths relative to project root
+    # Set default paths using PROJECT_ROOT
     if input_path is None:
-        input_path = os.path.join(
-            os.path.dirname(__file__),
-            '..',
-            '..',
-            'data',
-            'raw',
-            'zalo_ai_legal_text_retrieval',
-            'corpus.jsonl'
-        )
+        input_path = str(PROJECT_ROOT / "data" / "raw" / 
+                        "zalo_ai_legal_text_retrieval" / "corpus.jsonl")
+    else:
+        input_path = str(Path(input_path).resolve())
     
     if output_dir is None:
-        output_dir = os.path.join(
-            os.path.dirname(__file__),
-            '..',
-            '..',
-            'data',
-            'processed',
-            'zalo-legal'
-        )
+        output_dir = str(PROJECT_ROOT / "data" / "processed" / "zalo-legal")
+    else:
+        output_dir = str(Path(output_dir).resolve())
     
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)

@@ -7,6 +7,7 @@ import sys
 import os
 import signal
 import subprocess
+import html
 
 # Add src to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,6 +16,7 @@ import streamlit as st
 import requests
 import time
 from typing import Dict, Any, Optional
+from utils.law_registry import get_registry, normalize_act_code
 
 # Cấu hình trang
 st.set_page_config(
@@ -41,30 +43,61 @@ if "prefetched_ids" not in st.session_state:
 # Thêm biến trạng thái hiện nguồn nào đang mở
 if "active_source" not in st.session_state:
     st.session_state["active_source"] = None
-if "auto_submit" not in st.session_state:
-    st.session_state["auto_submit"] = False
+if "did_warmup" not in st.session_state:
+    st.session_state["did_warmup"] = False
+if "citation_contents" not in st.session_state:
+    st.session_state["citation_contents"] = {}
+if "active_citation" not in st.session_state:
+    st.session_state["active_citation"] = None
+if "ref_article_contents" not in st.session_state:
+    st.session_state["ref_article_contents"] = {}
+if "active_ref_article" not in st.session_state:
+    st.session_state["active_ref_article"] = None
 
-def check_api_health(max_retries=3, timeout=5):
-    """Kiểm tra trạng thái API với retry"""
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(f"{API_BASE_URL}/health", timeout=timeout)
-            if response.status_code == 200:
-                data = response.json()
-                return data
-            else:
-                st.warning(f"⚠️ API trả về status: {response.status_code}")
-        except requests.exceptions.ConnectionError:
-            if attempt == max_retries - 1:  # Chỉ hiển thị lỗi ở lần thử cuối
-                st.error(f"❌ Không thể kết nối API (timeout: {timeout}s)")
-        except Exception as e:
-            if attempt == max_retries - 1:  # Chỉ hiển thị lỗi ở lần thử cuối
-                st.error(f"❌ Lỗi kiểm tra API: {e}")
+st.markdown(
+    """
+    <style>
+    .la-source-box {
+        background-color: #f7f9ff;
+        border: 1px solid #d7dcf4;
+        border-radius: 10px;
+        padding: 12px 16px;
+        color: #1e2335;
+        white-space: pre-wrap;
+        line-height: 1.5;
+        font-size: 0.95rem;
+        font-family: 'Segoe UI', sans-serif;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+    }
+    .la-source-box strong {
+        color: #111421;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-        if attempt < max_retries - 1:
-            time.sleep(2)
-
+@st.cache_data(ttl=15, show_spinner=False)
+def cached_get(url: str, timeout: int = 5) -> Optional[Dict[str, Any]]:
+    try:
+        resp = requests.get(url, timeout=timeout)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        return None
     return None
+
+def check_api_health(max_retries=1, timeout=5):
+    """Kiểm tra trạng thái API (đã cache 15s) để tránh delay khi toggle UI."""
+    data = cached_get(f"{API_BASE_URL}/health", timeout=timeout)
+    if data is None and max_retries > 1:
+        # Thử lại nhẹ nhàng (ít lần) nếu cache miss và request fail
+        for _ in range(max_retries - 1):
+            time.sleep(0.5)
+            data = cached_get(f"{API_BASE_URL}/health", timeout=timeout)
+            if data:
+                break
+    return data
 
 def ask_question(question: str, top_k: int = 3) -> Optional[Dict[str, Any]]:
     """Gửi câu hỏi đến API"""
@@ -93,13 +126,8 @@ def get_stats():
 
 
 def get_health_details():
-    try:
-        response = requests.get(f"{API_BASE_URL}/health/details", timeout=5)
-        if response.status_code == 200:
-            return response.json()
-    except Exception:
-        pass
-    return None
+    data = cached_get(f"{API_BASE_URL}/health/details", timeout=5)
+    return data
 
 
 def trigger_reinitialize_rag():
@@ -115,12 +143,26 @@ def trigger_reinitialize_rag():
         st.error(f"Không thể gọi reinit: {e}")
         return None
 
+def warmup_backend(llm: bool = False) -> Optional[Dict[str, Any]]:
+    """Gọi warmup backend một lần để giảm độ trễ lần đầu.
+
+    Không hiển thị spinner; im lặng nếu lỗi.
+    """
+    try:
+        resp = requests.post(f"{API_BASE_URL}/warmup", params={"llm": str(bool(llm)).lower()}, timeout=8)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        return None
+    return None
+
 def main():
     """Main UI"""
 
     # Header
     st.title("⚖️ LegalAdvisor")
     st.markdown("**Hệ thống hỏi đáp pháp luật tiếng Việt**")
+    st.markdown("Nội dung chỉ sử dụng cho mục đích tham khảo.")
     st.markdown("---")
 
     # Kiểm tra API
@@ -135,6 +177,11 @@ def main():
 
         # Kiểm tra RAG system
     health_details = get_health_details()
+
+    # Warmup backend một lần trong mỗi session để giảm cold-start
+    if health and not st.session_state.get("did_warmup", False):
+        _ = warmup_backend(llm=False)
+        st.session_state["did_warmup"] = True
 
     if not health.get("rag_loaded", False):
         st.warning("⚠️ RAG system chưa được tải. Một số tính năng có thể không hoạt động.")
@@ -192,7 +239,13 @@ def main():
         # Settings
         col_a, col_b = st.columns(2)
         with col_a:
-            top_k = st.slider("Số nguồn tài liệu", 1, 5, 3)
+            top_k = st.slider(
+                "Số nguồn tài liệu",
+                min_value=1,
+                max_value=10,
+                value=5,
+                help="Tăng số nguồn để thu thập thêm ngữ cảnh khi cần",
+            )
         with col_b:
             submit_button = st.button("🔍 Tìm câu trả lời", type="primary", use_container_width=True)
 
@@ -201,6 +254,9 @@ def main():
             with st.spinner("🔄 Đang xử lý câu hỏi..."):
                 result = ask_question(question.strip(), top_k)
                 st.session_state["last_result"] = result
+                # Chuẩn bị sẵn danh sách nguồn hiển thị để lần toggle không phải tính lại
+                prepared_sources = []
+                registry = get_registry()
                 # Prefetch nội dung tài liệu để lần bấm 'Xem tài liệu' không bị trễ
                 try:
                     if result and result.get("ok") and result.get("sources"):
@@ -210,39 +266,57 @@ def main():
                                 continue
                             if cid in st.session_state["prefetched_ids"]:
                                 continue
-                            resp = requests.get(f"{API_BASE_URL}/sources/{cid}", timeout=3)
-                            if resp.status_code == 200:
-                                data = resp.json()
-                                content = (data.get("content", "") or "").replace('_', ' ')
+                            # Ưu tiên dùng content_full từ response để tránh gọi API riêng
+                            content = (src.get("content_full") or src.get("content") or "")
+                            if not content:
+                                # Fallback an toàn: gọi endpoint /sources/{id} nếu thiếu content
+                                try:
+                                    resp = requests.get(f"{API_BASE_URL}/sources/{cid}", timeout=3)
+                                    if resp.status_code == 200:
+                                        data = resp.json()
+                                        content = data.get("content", "") or ""
+                                except Exception:
+                                    content = ""
+                            content = content.replace('_', ' ')
+                            if content:
                                 st.session_state["source_contents"][cid] = content
                                 st.session_state["prefetched_ids"].add(cid)
+                        # Tạo danh sách nguồn đã render sẵn
+                        for i, source in enumerate(result["sources"], 1):
+                            corpus_id = source.get('corpus_id') or f"Nguồn {i}"
+                            type_ = source.get('type') or ""
+                            number = source.get('number') or ""
+                            year = source.get('year') or ""
+                            suffix = source.get('suffix')
+                            chunk_id = source.get('chunk_id')
+                            score = source.get('score')
+                            raw_code = (str(corpus_id).split('+')[0] if corpus_id else '').strip()
+                            act_code_norm = normalize_act_code(raw_code) if raw_code else ""
+                            info = registry.resolve_act(act_code_norm) if act_code_norm else None
+                            is_digit_article = str(suffix or '').isdigit()
+                            if info:
+                                article_part = f"Điều {suffix}" if is_digit_article else "Điều ?"
+                                loai = info.act_type or "Văn bản"
+                                trich_yeu = (info.official_title or info.act_name or info.act_code or "").strip()
+                                issuer = (info.issuer or "").strip()
+                                main_line = f"{article_part} — {loai} — {trich_yeu}"
+                                if issuer:
+                                    main_line += f" — Được ban hành bởi {issuer}"
+                                caption = f"Mã: `{act_code_norm}`"
+                            else:
+                                main_line = f"`{corpus_id}`"
+                                caption = None
+                            prepared_sources.append({
+                                "chunk_id": chunk_id,
+                                "main": main_line,
+                                "caption": caption,
+                                "score": score,
+                            })
+                        st.session_state["prepared_sources"] = prepared_sources
                 except Exception:
                     pass
 
-        # Tự động submit nếu chọn câu hỏi mẫu
-        if st.session_state.get("auto_submit") and st.session_state.get("question_input", "").strip():
-            result = ask_question(st.session_state["question_input"].strip(), top_k)
-            st.session_state["last_result"] = result
-            # Prefetch nội dung tài liệu
-            try:
-                if result and result.get("ok") and result.get("sources"):
-                    for src in result["sources"]:
-                        cid = src.get("chunk_id")
-                        if cid is None:
-                            continue
-                        if cid in st.session_state["prefetched_ids"]:
-                            continue
-                        resp = requests.get(f"{API_BASE_URL}/sources/{cid}", timeout=3)
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            content = (data.get("content", "") or "").replace('_', ' ')
-                            st.session_state["source_contents"][cid] = content
-                            st.session_state["prefetched_ids"].add(cid)
-            except Exception:
-                pass
-            st.session_state["auto_submit"] = False
-
-        # Luôn hiển thị last_result nếu có, để tránh reset khi bấm nút khác
+        # Display result (cached in session state)
         result = st.session_state.get("last_result")
         if result is None:
             pass
@@ -256,38 +330,236 @@ def main():
 
             # Bỏ hiển thị độ tin cậy theo yêu cầu
 
-            # Sources: hiển thị tiêu đề gọn + nút xem nội dung theo nhu cầu
-            if result.get("sources"):
+            # Sources: ưu tiên danh sách tài liệu đã gộp (sources_grouped); fallback về sources chunk
+            show_grouped = isinstance(result.get("sources_grouped"), list) and len(result.get("sources_grouped") or []) > 0
+            sources_grouped = result.get("sources_grouped") or []
+            if show_grouped or result.get("sources"):
                 st.subheader("📚 Nguồn tài liệu")
-                for i, source in enumerate(result["sources"], 1):
-                    corpus_id = source.get('corpus_id') or f"Nguồn {i}"
-                    type_ = source.get('type') or ""
-                    number = source.get('number') or ""
-                    year = source.get('year') or ""
-                    suffix = source.get('suffix')
-                    dieu = f" - Điều {suffix}" if str(suffix or '').isdigit() else ""
-                    score = source.get('score')
-                    chunk_id = source.get('chunk_id')
-
-                    st.markdown(f"**[{i}]** `{corpus_id}` ({type_} - {number} - {year}{dieu})")
-                    if isinstance(score, (int, float)):
-                        st.caption(f"Điểm: {score:.4f}")
-                    # Nút: khi bấm thì chỉ mở/đóng đúng nguồn này, không gọi API (đã prefetch)
-                    label = "Ẩn nội dung" if st.session_state["active_source"] == chunk_id else "Xem nội dung tham khảo"
-                    if st.button(label, key=f"btn_{chunk_id}"):
-                        if st.session_state["active_source"] == chunk_id:
-                            st.session_state["active_source"] = None
+                registry = get_registry()
+                if show_grouped:
+                    for idx, g in enumerate(sources_grouped, 1):
+                        act_code = g.get("act_code") or ""
+                        articles = g.get("articles") or []
+                        info = None
+                        try:
+                            info = registry.resolve_act(act_code) if act_code else None
+                        except Exception:
+                            info = None
+                        if info:
+                            loai = info.act_type or "Văn bản"
+                            trich_yeu = (info.official_title or info.act_name or info.act_code or "").strip()
+                            issuer = (info.issuer or "").strip()
+                            if articles:
+                                arts_str = ", ".join(str(a) for a in articles)
+                                article_part = f"Điều {arts_str}"
+                            else:
+                                article_part = "Văn bản"
+                            main_line = f"{article_part} — {loai} — {trich_yeu}"
+                            if issuer:
+                                main_line += f" — Được ban hành bởi {issuer}"
+                            caption = f"Mã: `{act_code}`"
                         else:
-                            st.session_state["active_source"] = chunk_id
-                    # Chỉ hiện nội dung nếu được mở
-                    if st.session_state["active_source"] == chunk_id:
-                        content = st.session_state["source_contents"].get(chunk_id, "Không có nội dung")
-                        st.text_area(
-                            "Nội dung tài liệu:",
-                            content,
-                            height=200,
-                            disabled=True
-                        )
+                            if articles:
+                                arts_str = ", ".join(str(a) for a in articles)
+                                main_line = f"Điều {arts_str} — `{act_code}`"
+                            else:
+                                main_line = f"`{act_code}`"
+                            caption = None
+
+                        st.markdown(f"**[{idx}]** {main_line}")
+                        if caption:
+                            st.caption(caption)
+
+                        # Hiển thị nút xem nội dung theo từng Điều (đồng bộ với phần trích dẫn)
+                        if articles:
+                            for art in articles:
+                                ref_key = f"ref:{act_code}:{int(art)}"
+                                lbl = "Ẩn nội dung Điều {0}".format(int(art)) if st.session_state["active_ref_article"] == ref_key else "Xem nội dung Điều {0}".format(int(art))
+                                if st.button(lbl, key=f"btn_ref_{ref_key}"):
+                                    if st.session_state["active_ref_article"] == ref_key:
+                                        st.session_state["active_ref_article"] = None
+                                    else:
+                                        if ref_key not in st.session_state["ref_article_contents"]:
+                                            try:
+                                                resp = requests.get(
+                                                    f"{API_BASE_URL}/citations/content",
+                                                    params={"act_code": act_code, "article": int(art)},
+                                                    timeout=8,
+                                                )
+                                                if resp.status_code == 200:
+                                                    data = resp.json()
+                                                    merged = (data.get("merged_content") or "").replace('_', ' ').strip()
+                                                    if merged:
+                                                        st.session_state["ref_article_contents"][ref_key] = merged
+                                                    else:
+                                                        # Fallback giống phần trích dẫn: ghép từ danh sách items
+                                                        items = data.get("items", []) or []
+                                                        merged_local = "\n\n".join(
+                                                            (itm.get("content") or "").replace('_', ' ').strip()
+                                                            for itm in items if (itm.get("content") or "").strip()
+                                                        ).strip()
+                                                        st.session_state["ref_article_contents"][ref_key] = merged_local or "Không có nội dung"
+                                                else:
+                                                    st.session_state["ref_article_contents"][ref_key] = f"Không thể tải nội dung (HTTP {resp.status_code})"
+                                            except Exception as e:
+                                                st.session_state["ref_article_contents"][ref_key] = f"Lỗi khi tải nội dung: {e}"
+                                        st.session_state["active_ref_article"] = ref_key
+                                    st.rerun()
+                                if st.session_state["active_ref_article"] == ref_key:
+                                    content = st.session_state["ref_article_contents"].get(ref_key, "Không có nội dung")
+                                    escaped = html.escape(content)
+                                    st.markdown(
+                                        f"<div class='la-source-box'>{escaped}</div>",
+                                        unsafe_allow_html=True,
+                                    )
+                else:
+                    # Fallback: hiển thị theo chunk như trước
+                    prepared = st.session_state.get("prepared_sources")
+                    if not prepared:
+                        prepared = []
+                        for idx, _ in enumerate(result["sources"], 1):
+                            prepared.append({"main": f"Nguồn {idx}", "caption": None, "score": None, "chunk_id": None})
+                    for i, p in enumerate(prepared, 1):
+                        st.markdown(f"**[{i}]** {p['main']}")
+                        if p.get("caption"):
+                            st.caption(p["caption"]) 
+                        chunk_id = p.get("chunk_id") or result["sources"][i-1].get("chunk_id")
+                        label = "Ẩn nội dung" if st.session_state["active_source"] == chunk_id else "Xem nội dung tham khảo"
+                        if st.button(label, key=f"btn_{chunk_id}"):
+                            if st.session_state["active_source"] == chunk_id:
+                                st.session_state["active_source"] = None
+                            else:
+                                st.session_state["active_source"] = chunk_id
+                            st.rerun()
+                        if st.session_state["active_source"] == chunk_id:
+                            content = st.session_state["source_contents"].get(chunk_id, "Không có nội dung")
+                            escaped = html.escape(content)
+                            st.markdown(
+                                f"<div class='la-source-box'>{escaped}</div>",
+                                unsafe_allow_html=True,
+                            )
+
+            # Citations: hiển thị tách biệt, không làm giảm số lượng nguồn chính
+            citations = result.get("citations") or []
+            if isinstance(citations, list) and len(citations) > 0:
+                st.subheader("📎 Tài liệu trích dẫn")
+                registry = get_registry()
+                for j, c in enumerate(citations, 1):
+                    code = c.get("act_code") or ""
+                    arts = c.get("articles") or []
+                    supplemented_by = c.get("supplemented_by") or []
+                    info = None
+                    try:
+                        norm_code = normalize_act_code(code)
+                        if norm_code:
+                            info = registry.resolve_act(norm_code)
+                    except Exception:
+                        info = None
+                    if info:
+                        loai = info.act_type or "Văn bản"
+                        trich_yeu = (info.official_title or info.act_name or info.act_code or "").strip()
+                        issuer = (info.issuer or "").strip()
+                        # Đưa các Điều được trích dẫn (của văn bản này) lên đầu theo yêu cầu
+                        try:
+                            arts_sorted_for_title = sorted(set(int(a) for a in (arts or [])))
+                            if arts_sorted_for_title:
+                                arts_str = ", ".join(str(a) for a in arts_sorted_for_title)
+                                header = f"Điều {arts_str} — {loai} — {trich_yeu}"
+                            else:
+                                header = f"{loai} — {trich_yeu}"
+                        except Exception:
+                            header = f"{loai} — {trich_yeu}"
+                        if issuer:
+                            header += f" — Ban hành bởi {issuer}"
+                        # Nếu backend trả về danh sách tài liệu tham khảo có trích dẫn tới văn bản này -> hiển thị "Bổ sung cho ..."
+                        try:
+                            titles: list[str] = []
+                            # supplemented_by là danh sách dict {act_code, articles} trong đó
+                            # articles = các Điều của VĂN BẢN THAM CHIẾU (nơi đề cập đến trích dẫn)
+                            for ref in supplemented_by:
+                                ref_code = ref.get("act_code") if isinstance(ref, dict) else None
+                                ref_arts = ref.get("articles") if isinstance(ref, dict) else []
+                                if not ref_code:
+                                    continue
+                                nref = normalize_act_code(ref_code)
+                                inf = registry.resolve_act(nref) if nref else None
+                                # Build article string
+                                art_str = ""
+                                try:
+                                    if isinstance(ref_arts, list) and len(ref_arts) > 0:
+                                        art_str = "Điều " + ",".join(str(int(a)) for a in ref_arts)
+                                except Exception:
+                                    art_str = ""
+
+                                if inf:
+                                    loai_r = inf.act_type or "Văn bản"
+                                    trich_yeu_r = (inf.official_title or inf.act_name or inf.act_code or "").strip()
+                                    if art_str:
+                                        titles.append(f"{art_str} - {loai_r} - {trich_yeu_r}")
+                                    else:
+                                        titles.append(f"{loai_r} - {trich_yeu_r}")
+                                else:
+                                    if art_str:
+                                        titles.append(f"{art_str} - {nref}")
+                                    else:
+                                        titles.append(f"{nref}")
+                            if titles:
+                                # Gộp ngắn gọn; nếu nhiều thì nối bằng dấu phẩy
+                                header += f" — Bổ sung cho {', '.join(titles)}"
+                        except Exception:
+                            pass
+                        st.markdown(f"**[{j}]** {header}")
+                        st.caption(f"Mã: `{norm_code}`")
+                    else:
+                        st.markdown(f"**[{j}]** `{code}`")
+
+                    # Danh sách Điều được trích dẫn (nếu có)
+                    if isinstance(arts, list) and len(arts) > 0:
+                        try:
+                            arts_sorted = sorted(set(int(a) for a in arts))
+                        except Exception:
+                            arts_sorted = arts
+                        # Hiển thị từng Điều kèm nút xem nội dung (giống phần tham khảo)
+                        for art in arts_sorted:
+                            cit_key = f"{norm_code}:{int(art)}" if 'norm_code' in locals() and norm_code else f"{code}:{int(art)}"
+                            label = "Ẩn nội dung" if st.session_state["active_citation"] == cit_key else f"Xem nội dung trích dẫn — Điều {art}"
+                            if st.button(label, key=f"btn_cit_{cit_key}"):
+                                if st.session_state["active_citation"] == cit_key:
+                                    st.session_state["active_citation"] = None
+                                else:
+                                    # Prefetch nếu chưa có
+                                    if cit_key not in st.session_state["citation_contents"]:
+                                        try:
+                                            resp = requests.get(
+                                                f"{API_BASE_URL}/citations/content",
+                                                params={"act_code": norm_code or code, "article": int(art)},
+                                                timeout=8,
+                                            )
+                                            if resp.status_code == 200:
+                                                data = resp.json()
+                                                merged_api = (data.get("merged_content") or "").replace('_', ' ').strip()
+                                                if merged_api:
+                                                    st.session_state["citation_contents"][cit_key] = merged_api
+                                                else:
+                                                    items = data.get("items", []) or []
+                                                    merged_local = "\n\n".join(
+                                                        (itm.get("content") or "").replace('_', ' ')
+                                                        for itm in items
+                                                    ).strip()
+                                                    st.session_state["citation_contents"][cit_key] = merged_local or "Không có nội dung"
+                                            else:
+                                                st.session_state["citation_contents"][cit_key] = f"Không thể tải nội dung (HTTP {resp.status_code})"
+                                        except Exception as e:
+                                            st.session_state["citation_contents"][cit_key] = f"Lỗi khi tải nội dung: {e}"
+                                    st.session_state["active_citation"] = cit_key
+                                st.rerun()
+                            if st.session_state["active_citation"] == cit_key:
+                                content = st.session_state["citation_contents"].get(cit_key, "Không có nội dung")
+                                escaped = html.escape(content)
+                                st.markdown(
+                                    f"<div class='la-source-box'>{escaped}</div>",
+                                    unsafe_allow_html=True,
+                                )
 
         else:
             detail = result.get("detail") or result.get("message") or result.get("error")
@@ -327,7 +599,67 @@ def main():
         for q in sample_questions:
             if st.button(q, use_container_width=True, key=f"sample_{q}"):
                 st.session_state["question_input"] = q
-                st.session_state["auto_submit"] = True
+                # Tự động submit câu hỏi mẫu
+                with st.spinner("🔄 Đang xử lý câu hỏi..."):
+                    result = ask_question(q.strip(), top_k=top_k)
+                    st.session_state["last_result"] = result
+                    # Prefetch nội dung tài liệu (ưu tiên content_full từ response)
+                    try:
+                        if result and result.get("ok") and result.get("sources"):
+                            for src in result["sources"]:
+                                cid = src.get("chunk_id")
+                                if cid is None:
+                                    continue
+                                if cid in st.session_state["prefetched_ids"]:
+                                    continue
+                                content = (src.get("content_full") or src.get("content") or "")
+                                if not content:
+                                    try:
+                                        resp = requests.get(f"{API_BASE_URL}/sources/{cid}", timeout=3)
+                                        if resp.status_code == 200:
+                                            data = resp.json()
+                                            content = data.get("content", "") or ""
+                                    except Exception:
+                                        content = ""
+                                content = content.replace('_', ' ')
+                                if content:
+                                    st.session_state["source_contents"][cid] = content
+                                    st.session_state["prefetched_ids"].add(cid)
+                            # Chuẩn bị danh sách nguồn render sẵn cho mẫu
+                            prepared_sources = []
+                            registry = get_registry()
+                            for i, source in enumerate(result["sources"], 1):
+                                corpus_id = source.get('corpus_id') or f"Nguồn {i}"
+                                suffix = source.get('suffix')
+                                chunk_id = source.get('chunk_id')
+                                score = source.get('score')
+                                raw_code = (str(corpus_id).split('+')[0] if corpus_id else '').strip()
+                                act_code_norm = normalize_act_code(raw_code) if raw_code else ""
+                                info = registry.resolve_act(act_code_norm) if act_code_norm else None
+                                is_digit_article = str(suffix or '').isdigit()
+                                if info:
+                                    article_part = f"Điều {suffix}" if is_digit_article else "Điều ?"
+                                    loai = info.act_type or "Văn bản"
+                                    trich_yeu = (info.official_title or info.act_name or info.act_code or "").strip()
+                                    issuer = (info.issuer or "").strip()
+                                    main_line = f"{article_part} — {loai} — {trich_yeu}"
+                                    if issuer:
+                                        main_line += f" — Được ban hành bởi {issuer}"
+                                    caption = f"Mã: `{act_code_norm}`"
+                                else:
+                                    main_line = f"`{corpus_id}`"
+                                    caption = None
+                                prepared_sources.append({
+                                    "chunk_id": chunk_id,
+                                    "main": main_line,
+                                    "caption": caption,
+                                    "score": score,
+                                })
+                            st.session_state["prepared_sources"] = prepared_sources
+                    except Exception:
+                        pass
+                # Force UI rerun để hiển thị kết quả
+                st.rerun()
 
     # Footer
     st.markdown("---")

@@ -11,8 +11,9 @@ import random
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterator, List, Sequence, Set, Tuple
+from typing import Dict, Iterator, List, Sequence, Set, Tuple, Any
 
+import os
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -48,6 +49,16 @@ class TrainConfig:
     max_hard_negatives: int
     eval_batch_size: int
     top_k: int
+    # New options
+    device: str
+    fp16: bool
+    grad_checkpointing: bool
+    max_seq_length: int
+    num_workers: int
+    early_stopping_patience: int
+    save_best_only: bool
+    resume_from: Path | None
+    pairs_only: bool
 
 
 @dataclass
@@ -75,6 +86,82 @@ def compose_doc_text(record: JsonDict) -> str:
     if title and body:
         return f"{title}\n{body}"
     return title or body
+
+
+def _get_tokenizer(model: SentenceTransformer):
+    """Lấy tokenizer bên trong SentenceTransformer nếu có (dùng cho segment)."""
+    try:
+        first = model[0]
+    except Exception:
+        first = None
+    if first is not None:
+        tok = getattr(first, "tokenizer", None)
+        if tok is not None:
+            return tok
+    return getattr(model, "tokenizer", None)
+
+
+def segment_text_for_training(
+    text: str,
+    tokenizer: Any,
+    max_tokens: int,
+    overlap: int,
+) -> List[str]:
+    """Cắt Điều thành các đoạn biểu diễn phục vụ huấn luyện (multi-vector per Điều).
+
+    - Nếu Điều ngắn (≤ max_tokens) → 1 đoạn như cũ.
+    - Nếu dài → sliding window theo token với overlap.
+    - Luôn trả về danh sách text các đoạn (không thay đổi label doc-level)."""
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    if tokenizer is None:
+        # Fallback ước lượng: ~4 ký tự / token
+        approx_tokens = max_tokens * 4
+        if len(text) <= approx_tokens:
+            return [text]
+        segments: List[str] = []
+        stride = max(1, approx_tokens - overlap * 4)
+        start = 0
+        while start < len(text):
+            end = min(len(text), start + approx_tokens)
+            seg = text[start:end].strip()
+            if seg:
+                segments.append(seg)
+            if end >= len(text):
+                break
+            start += stride
+        return segments
+
+    try:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+    except Exception:
+        return [text]
+
+    total_tokens = len(token_ids)
+    if total_tokens <= max_tokens:
+        return [text]
+
+    segments: List[str] = []
+    stride = max(1, max_tokens - overlap)
+    start = 0
+    while start < total_tokens:
+        end = min(total_tokens, start + max_tokens)
+        window_ids = token_ids[start:end]
+        if not window_ids:
+            break
+        try:
+            seg_text = tokenizer.decode(window_ids, skip_special_tokens=True).strip()
+        except Exception:
+            seg_text = text
+        if seg_text:
+            segments.append(seg_text)
+        if end >= total_tokens:
+            break
+        start += stride
+
+    return segments or [text]
 
 
 def load_pairs(pairs_path: Path) -> Tuple[Dict[str, str], Dict[str, Set[str]]]:
@@ -143,9 +230,21 @@ def load_triplet_examples(
     triplets_path: Path,
     train_query_ids: Set[str],
     max_hard_negatives: int,
+    model: SentenceTransformer,
+    max_seq_length: int,
+    segment_overlap: int = 64,
+    pairs_only: bool = False,
 ) -> Tuple[List[InputExample], int]:
+    """Sinh training examples với multi-segment per Điều.
+
+    - Mỗi triplet → nhiều InputExample nếu positive/negative dài.
+    - Query giữ nguyên; positive/negative được cắt theo token (max_seq_length, overlap).
+    - Vẫn dùng MultipleNegativesRankingLoss (in-batch negatives)."""
     examples: List[InputExample] = []
     unique_queries: Set[str] = set()
+
+    tokenizer = _get_tokenizer(model)
+    overlap = max(0, min(segment_overlap, max_seq_length // 2))
 
     for record in tqdm(read_jsonl(triplets_path), desc="Read triplets", unit="row"):
         query_id = str(record.get("query_id") or "").strip()
@@ -156,25 +255,41 @@ def load_triplet_examples(
         negative_texts = record.get("negative_texts") or []
         if not query_text or not positive_text:
             continue
-        sentences: List[str] = [query_text, positive_text]
-        if isinstance(negative_texts, (list, tuple)) and max_hard_negatives > 0:
+
+        # Segment positive Điều
+        pos_segments = segment_text_for_training(positive_text, tokenizer, max_seq_length, overlap)
+        if not pos_segments:
+            continue
+
+        # Segment negatives nếu dùng hard negatives
+        neg_segments_all: List[str] = []
+        if not pairs_only and isinstance(negative_texts, (list, tuple)) and max_hard_negatives > 0:
             for neg_text in negative_texts[:max_hard_negatives]:
                 neg_str = str(neg_text or "").strip()
-                if neg_str:
-                    sentences.append(neg_str)
-        if len(sentences) < 2:
-            continue
-        examples.append(InputExample(texts=sentences))
-        unique_queries.add(query_id)
+                if not neg_str:
+                    continue
+                segs = segment_text_for_training(neg_str, tokenizer, max_seq_length, overlap)
+                neg_segments_all.extend(segs)
+
+        # Multi-instance positives: mỗi segment của Điều dương → một InputExample
+        for pos_seg in pos_segments:
+            sentences: List[str] = [query_text, pos_seg]
+            if neg_segments_all:
+                sentences.extend(neg_segments_all)
+            if len(sentences) < 2:
+                continue
+            examples.append(InputExample(texts=sentences))
+            unique_queries.add(query_id)
 
     if not examples:
         raise ValueError("No training examples were constructed from triplets")
     return examples, len(unique_queries)
 
 
-def create_dataloader(model: SentenceTransformer, examples: List[InputExample], batch_size: int) -> DataLoader:
+def create_dataloader(model: SentenceTransformer, examples: List[InputExample], batch_size: int, num_workers: int = 0) -> DataLoader:
     dataset = SentencesDataset(examples, model=model)
-    dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, drop_last=False)
+    # Windows an toàn: num_workers mặc định 0; cho phép tăng qua config
+    dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, drop_last=False, num_workers=max(0, int(num_workers)))
     dataloader.collate_fn = model.smart_batching_collate
     return dataloader
 
@@ -250,18 +365,58 @@ def train(config: TrainConfig) -> None:
     dev_ids = choose_dev_queries(all_query_ids, config.dev_ratio, config.seed)
     train_query_ids = set(all_query_ids) - dev_ids
     dev_queries = build_dev_queries(query_texts, positives, dev_ids)
+
+    # Resume nếu có
+    if config.resume_from:
+        model = SentenceTransformer(str(config.resume_from))
+    else:
+        model = SentenceTransformer(config.base_model)
+
+    # Áp max_seq_length đồng bộ với inference pipeline và segment policy
+    try:
+        if hasattr(model, "max_seq_length"):
+            model.max_seq_length = max(8, int(config.max_seq_length))
+        try:
+            first = model[0]
+            if hasattr(first, "max_seq_length"):
+                setattr(first, "max_seq_length", max(8, int(config.max_seq_length)))
+        except Exception:
+            pass
+        # Đồng bộ với ENV để build_index / service dùng chung L
+        os.environ["LEGALADVISOR_ENCODER_MAX_SEQ_LENGTH"] = str(int(config.max_seq_length))
+    except Exception:
+        pass
+
+    # Chuẩn bị training examples sau khi đã có model/tokenizer
     examples, unique_train_queries = load_triplet_examples(
         config.triplets_path,
         train_query_ids,
         config.max_hard_negatives,
+        model=model,
+        max_seq_length=int(config.max_seq_length),
+        pairs_only=config.pairs_only,
     )
     doc_ids, doc_texts = load_corpus_texts(config.corpus_path)
 
-    model = SentenceTransformer(config.base_model)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Thiết bị
+    if config.device == "cpu":
+        device = torch.device("cpu")
+    elif config.device == "cuda":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:  # auto
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    train_dataloader = create_dataloader(model, examples, config.batch_size)
+    # Bật gradient checkpointing cho backbone để tiết kiệm RAM nếu cần
+    if config.grad_checkpointing:
+        try:
+            first = model[0]
+            if hasattr(first, "auto_model") and hasattr(first.auto_model, "gradient_checkpointing_enable"):
+                first.auto_model.gradient_checkpointing_enable()
+        except Exception:
+            pass
+
+    train_dataloader = create_dataloader(model, examples, config.batch_size, num_workers=config.num_workers)
     loss_fn = MultipleNegativesRankingLoss(model)
 
     total_update_steps = math.ceil(len(train_dataloader) / config.accumulation) * config.epochs
@@ -277,6 +432,18 @@ def train(config: TrainConfig) -> None:
 
     global_step = 0
     metrics_history: List[Dict[str, float]] = []
+    best_metric = -1.0
+    epochs_no_improve = 0
+
+    # AMP scaler
+    scaler = torch.amp.GradScaler(enabled=(config.fp16 and device.type == "cuda"))
+
+    def move_features_to_device(data):
+        if isinstance(data, dict):
+            return batch_to_device(data, device)
+        if isinstance(data, list):
+            return [batch_to_device(item, device) for item in data]
+        return data
 
     try:
         for epoch in range(config.epochs):
@@ -288,18 +455,34 @@ def train(config: TrainConfig) -> None:
 
             progress = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{config.epochs}")
             for batch in progress:
-                features, labels = batch
-                features = batch_to_device(features, device)
-                loss = loss_fn(features, labels)
-                loss = loss / config.accumulation
-                loss.backward()
+                if isinstance(batch, dict):
+                    features = batch.get("sentence_features")
+                    labels = batch.get("labels")
+                else:
+                    features, labels = batch
+                features = move_features_to_device(features)
+                if isinstance(labels, torch.Tensor):
+                    labels = labels.to(device)
+                if scaler.is_enabled():
+                    with torch.cuda.amp.autocast():
+                        loss = loss_fn(features, labels)
+                        loss = loss / config.accumulation
+                    scaler.scale(loss).backward()
+                else:
+                    loss = loss_fn(features, labels)
+                    loss = loss / config.accumulation
+                    loss.backward()
 
                 accumulated += 1
                 running_loss += loss.item()
 
                 if accumulated % config.accumulation == 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                    optimizer.step()
+                    if scaler.is_enabled():
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
 
@@ -314,7 +497,11 @@ def train(config: TrainConfig) -> None:
 
             if accumulated != 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                optimizer.step()
+                if scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
@@ -341,11 +528,36 @@ def train(config: TrainConfig) -> None:
             mrr_pct = metrics["mrr@10"] * 100.0
             print(f"Epoch {epoch+1}: recall@10={recall_pct:.2f}% mrr@10={mrr_pct:.2f}%")
 
+            # Lưu checkpoint theo epoch
+            epoch_dir = config.output_dir / f"checkpoint-epoch{epoch+1}"
+            epoch_dir.mkdir(parents=True, exist_ok=True)
+            model.save(str(epoch_dir))
+
+            # Theo dõi best theo recall@10, có thể điều chỉnh theo mrr@10
+            current = float(metrics.get("recall@10", 0.0))
+            if current > best_metric + 1e-6:
+                best_metric = current
+                epochs_no_improve = 0
+                best_dir = config.output_dir / "best"
+                best_dir.mkdir(parents=True, exist_ok=True)
+                model.save(str(best_dir))
+            else:
+                epochs_no_improve += 1
+
+            if config.early_stopping_patience > 0 and epochs_no_improve >= config.early_stopping_patience:
+                print(f"Early stopping after {epoch+1} epochs (no improvement {epochs_no_improve} >= {config.early_stopping_patience})")
+                break
+
     finally:
         loss_handle.close()
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    model.save(str(config.output_dir))
+    # Nếu chỉ muốn lưu best, copy từ best; mặc định lưu full model cuối
+    if config.save_best_only and (config.output_dir / "best").exists():
+        # best đã lưu trong output_dir/best, không cần ghi đè
+        pass
+    else:
+        model.save(str(config.output_dir))
 
     metrics_path = RESULTS_DIR / "dev_metrics.json"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -419,6 +631,16 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--max-hard-negatives", type=int, default=4)
     parser.add_argument("--eval-batch-size", type=int, default=128)
     parser.add_argument("--top-k", type=int, default=10)
+    # New flags
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="Thiết bị train: auto/cpu/cuda")
+    parser.add_argument("--fp16", action="store_true", help="Dùng mixed precision (FP16) nếu có CUDA")
+    parser.add_argument("--grad-checkpointing", action="store_true", help="Bật gradient checkpointing cho backbone")
+    parser.add_argument("--max-seq-len", type=int, default=256, help="Giới hạn tokenizer/model max_seq_length")
+    parser.add_argument("--num-workers", type=int, default=0, help="num_workers cho DataLoader (Windows nên để 0)")
+    parser.add_argument("--early-stopping-patience", type=int, default=0, help="Dừng sớm nếu không cải thiện (số epoch)")
+    parser.add_argument("--save-best-only", action="store_true", help="Chỉ giữ checkpoint tốt nhất (best)")
+    parser.add_argument("--resume-from", type=Path, default=None, help="Tiếp tục huấn luyện từ checkpoint")
+    parser.add_argument("--pairs-only", action="store_true", help="Bỏ qua negatives trong triplets, dùng in-batch negatives")
 
     args = parser.parse_args()
 
@@ -439,6 +661,15 @@ def parse_args() -> TrainConfig:
         max_hard_negatives=max(0, args.max_hard_negatives),
         eval_batch_size=max(8, args.eval_batch_size),
         top_k=max(1, args.top_k),
+        device=args.device,
+        fp16=bool(args.fp16),
+        grad_checkpointing=bool(args.grad_checkpointing),
+        max_seq_length=max(8, int(args.max_seq_len)),
+        num_workers=max(0, int(args.num_workers)),
+        early_stopping_patience=max(0, int(args.early_stopping_patience)),
+        save_best_only=bool(args.save_best_only),
+        resume_from=resolve_path(args.resume_from) if args.resume_from else None,
+        pairs_only=bool(args.pairs_only),
     )
     return config
 

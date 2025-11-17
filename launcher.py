@@ -16,11 +16,6 @@ def check_requirements():
     """Kiểm tra các yêu cầu cơ bản"""
     print("🔍 Kiểm tra yêu cầu hệ thống...")
 
-    # Kiểm tra Python version
-    if sys.version_info < (3, 8):
-        print(f"❌ Cần Python >= 3.8, hiện tại: {sys.version}")
-        return False
-
     # Kiểm tra GPU và hiển thị thông tin
     print("🔥 Kiểm tra GPU support...")
     try:
@@ -62,17 +57,29 @@ def check_requirements():
             print(f"   - {missing}")
         print("   → Hãy chạy: python scripts/zalo_legal_preprocess.py (sau khi đã download)")
 
-    # Kiểm tra mô hình retrieval đã sẵn sàng chưa
+    # Kiểm tra mô hình retrieval đã sẵn sàng chưa (hỗ trợ cấu trúc mới và cũ)
     retrieval_dir = Path("models/retrieval")
-    index_path = retrieval_dir / "faiss_index.bin"
-    meta_path = retrieval_dir / "metadata.json"
-    info_path = retrieval_dir / "model_info.json"
-    if not retrieval_dir.exists() or not index_path.exists() or not meta_path.exists() or not info_path.exists():
+    index_dir = retrieval_dir / "index"
+    # Cấu trúc mới
+    new_index_path = index_dir / "chunks_index.faiss"
+    new_info_path = index_dir / "model_info.json"
+    new_meta_path = index_dir / "metadata.json"
+    # Cấu trúc cũ
+    old_index_path = retrieval_dir / "faiss_index.bin"
+    old_info_path = retrieval_dir / "model_info.json"
+    old_meta_path = retrieval_dir / "metadata.json"
+
+    has_new = retrieval_dir.exists() and new_index_path.exists() and new_info_path.exists()
+    has_old = retrieval_dir.exists() and old_index_path.exists() and old_info_path.exists()
+
+    if not has_new and not has_old:
         print("⚠️  Thiếu mô hình retrieval (FAISS/metadata/model_info).")
         print("   💡 Vui lòng chạy riêng bước build index trước khi launch:")
         print("      conda activate LegalAdvisor")
         print("      python src/retrieval/build_index.py")
     else:
+        # Ưu tiên đọc model_info theo cấu trúc mới
+        info_path = new_info_path if has_new else old_info_path
         try:
             with open(info_path, 'r', encoding='utf-8') as f:
                 mi = json.load(f)
@@ -80,9 +87,13 @@ def check_requirements():
             dim = mi.get('embedding_dim')
             metric = mi.get('metric_type', 'ip')
             pooling = mi.get('pooling', 'unknown')
-            print(f"🔧 Retrieval model: {model_name} | dim={dim} | metric={metric} | pooling={pooling}")
+            location = "index/" if has_new else "legacy/"
+            print(f"🔧 Retrieval model: {model_name} | dim={dim} | metric={metric} | pooling={pooling} ({location})")
         except Exception:
             print("ℹ️  Không đọc được model_info.json để hiển thị thông tin mô hình.")
+        # Cảnh báo nhẹ nếu thiếu metadata (chỉ ảnh hưởng endpoint /stats)
+        if not (new_meta_path.exists() or old_meta_path.exists()):
+            print("ℹ️  Chưa tìm thấy metadata.json (chỉ ảnh hưởng thống kê /stats).")
 
     print("✅ Kiểm tra hoàn thành!")
     return True
@@ -208,20 +219,29 @@ def main():
         pass
     print("\n" + "="*50)
     print("   🏛️  LegalAdvisor - Hệ thống hỗ trợ pháp lý")
-    print("   🚀 Phiên bản: 2.0 (Gemini Integration)")
     print("="*50 + "\n")
     
-    # Kiểm tra xem có GPU không
+    # Kiểm tra xem có cờ ép buộc sử dụng CPU hay không (env override)
     use_gpu = False
-    try:
-        import torch
-        if torch.cuda.is_available():
+    env_override = os.environ.get("LEGALADVISOR_USE_GPU")
+    if env_override is not None:
+        # Accept common truthy/falsy values
+        if env_override.lower() in ("1", "true", "yes", "on"):
             use_gpu = True
-            print("✅ Đã phát hiện GPU, sẽ sử dụng GPU để tăng tốc xử lý")
+            print("✅ LEGALADVISOR_USE_GPU env override: bật GPU")
         else:
-            print("ℹ️  Không phát hiện GPU, sẽ sử dụng CPU")
-    except ImportError:
-        print("⚠️  Không thể kiểm tra GPU do chưa cài đặt PyTorch")
+            use_gpu = False
+            print("✅ LEGALADVISOR_USE_GPU env override: tắt GPU (sử dụng CPU)")
+    else:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                use_gpu = True
+                print("✅ Đã phát hiện GPU, sẽ sử dụng GPU để tăng tốc xử lý")
+            else:
+                print("ℹ️  Không phát hiện GPU, sẽ sử dụng CPU")
+        except ImportError:
+            print("⚠️  Không thể kiểm tra GPU do chưa cài đặt PyTorch")
     print("🤖 Sử dụng Google Gemini cho text generation (bắt buộc)")
 
     # Setup signal handlers

@@ -1,26 +1,47 @@
 # LegalAdvisor Environment Variables
 # Copy this file to .env and fill in your actual values
 
-# Google Gemini API Key
+# ⚠️  REQUIRED: Google Gemini API Key
 # Get your API key from: https://makersuite.google.com/app/apikey
 GOOGLE_API_KEY=your_google_gemini_api_key_here
 
-# Embedding
-LEGALADVISOR_EMB_MODEL=VoVanPhuc/sup-SimCSE-VietNamese-phobert-base
-LEGALADVISOR_EMB_KEEP_UNDERSCORE=1
-LEGALADVISOR_EMB_BATCH=256
-LEGALADVISOR_USE_GPU=auto  # hoặc 1 để ép GPU nếu sẵn CUDA
+# GPU Settings (Optional)
+# Set to 1 to force GPU usage, 0 for CPU only, or leave empty for auto-detect
+LEGALADVISOR_USE_GPU=1
 
-# FAISS HNSW (tùy chọn, để tăng tốc truy vấn)
-LEGALADVISOR_FAISS_HNSW=1
-LEGALADVISOR_HNSW_M=32
-LEGALADVISOR_HNSW_EF_CONSTRUCTION=200
-LEGALADVISOR_HNSW_EF_SEARCH=64
+# Retrieval encoder seq length (đề xuất 384 cho PhoBERT/SimCSE; có thể thử 512 nếu đủ RAM)
+LEGALADVISOR_ENCODER_MAX_SEQ_LENGTH=384
 
-# Application Settings
-LOG_LEVEL=INFO
-MAX_TOKENS=1000
-TEMPERATURE=0.7
+# API Server Settings (Optional)
+# Rate limiting configuration
+LEGALADVISOR_RATE_LIMIT_WINDOW=60
+LEGALADVISOR_RATE_LIMIT_MAX=30
 
-# Database Settings (if using database)
-# DATABASE_URL=sqlite:///legaladvisor.db
+# Logging configuration
+LEGALADVISOR_LOG_QUESTIONS=0
+LEGALADVISOR_RATE_LIMIT_CLEANUP=1
+LEGALADVISOR_RATE_LIMIT_SWEEP_INTERVAL=60
+
+# API Base URL (for UI to connect to API)
+LEGALADVISOR_API_BASE_URL=http://localhost:8000
+
+# PyTorch/Transformers Settings (Internal - do not change unless needed)
+TRANSFORMERS_NO_TORCHVISION=1
+
+# Path configurations (Optional - auto-detect if not set)
+# LEGALADVISOR_ROOT=/path/to/LegalAdvisor
+# LEGALADVISOR_MODELS_DIR=/path/to/models/retrieval
+# LEGALADVISOR_DATA_DIR=/path/to/data/processed
+# LEGALADVISOR_EMBEDDING_MODEL_DIR=/path/to/local/encoder
+# Ví dụ model tiếng Việt: VoVanPhuc/sup-SimCSE-VietNamese-phobert-base
+# Sau khi build index bằng --base-model model sẽ được lưu vào models/retrieval/vi_simcse_phobert
+# LAW_REGISTRY_PATH=E:\\Project\\LegalAdvisor\\data\\registry\\law_registry.json
+
+# Citation expansion (Phase 2 - placeholders)
+# ENABLE_CITATION_EXPANSION=0
+# CITATION_DEPTH=1
+# CITATION_WEIGHT=0.2
+# MAX_CITED_SOURCES=5
+
+# Development Settings (Optional - for testing)
+# LEGALADVISOR_SKIP_RAG_INIT=0

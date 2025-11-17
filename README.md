@@ -186,9 +186,78 @@ streamlit run src/app/ui.py
 
 ## 📈 Metrics
 
-- **61,425 chunks** văn bản pháp luật Zalo-AI-Legal
-- **127 MB** corpus JSONL format
-- **Retrieval accuracy**: ~77% relevant scores
-- **Response time**: < 2 giây per query  
-- **Model size**: ~500MB (FAISS + SentenceTransformer)
-- **Test coverage**: 100% (14/14 tests passed)
+---
+
+## 🇻🇳 Retrieval Model Tiếng Việt & Fine-tune
+
+Tối ưu chất lượng truy hồi cho pháp luật tiếng Việt bằng cách dùng encoder chuyên biệt và fine-tune trên ~61k Điều.
+
+### 1. Chọn model tiếng Việt
+Khuyến nghị: `VoVanPhuc/sup-SimCSE-VietNamese-phobert-base` (768-dim, tối ưu semantic similarity tiếng Việt).
+Thiết lập ENV: `LEGALADVISOR_ENCODER_MAX_SEQ_LENGTH=384` (có thể thử 512 nếu benchmark ổn về RAM/latency).
+
+### 2. Build index với model tiếng Việt (chưa fine-tune trên luật)
+```powershell
+conda activate LegalAdvisor
+$env:LEGALADVISOR_ENCODER_MAX_SEQ_LENGTH="384"
+python .\src\retrieval\build_index.py \
+  --base-model VoVanPhuc/sup-SimCSE-VietNamese-phobert-base \
+  --model-dir .\models\retrieval\vi_simcse_phobert \
+  --output-dir .\models\retrieval\index \
+  --batch-size 128 \
+  --device cpu \
+  --verbose
+```
+
+### 3. Fine-tune trên dữ liệu luật
+Sử dụng heading/tên Điều làm query, thân Điều làm positive; hard negatives từ Điều khác trong cùng văn bản.
+```powershell
+conda activate LegalAdvisor
+python .\scripts\train_retrieval.py \
+  --corpus .\data\processed\zalo-legal\corpus_cleaned.jsonl \
+  --triplets .\data\processed\zalo-legal\triplets_train.jsonl \
+  --pairs .\data\processed\zalo-legal\train_pairs_enriched.jsonl \
+  --output-dir .\models\retrieval\vi_legal_ft \
+  --base-model VoVanPhuc/sup-SimCSE-VietNamese-phobert-base \
+  --epochs 12 \
+  --early-stopping-patience 2 \
+  --batch-size 32 \
+  --accumulation 2 \
+  --lr 2e-5 \
+  --warmup-ratio 0.1 \
+  --max-seq-len 384 \
+  --device auto \
+  --eval-batch-size 128 \
+  --save-best-only
+```
+
+### 4. Rebuild index từ model đã fine-tune
+```powershell
+conda activate LegalAdvisor
+$env:LEGALADVISOR_ENCODER_MAX_SEQ_LENGTH="384"
+python .\src\retrieval\build_index.py \
+  --model-dir .\models\retrieval\vi_legal_ft\best \
+  --output-dir .\models\retrieval\index \
+  --batch-size 128 \
+  --device cpu \
+  --verbose
+```
+
+### 5. Benchmark so sánh base đa ngôn ngữ vs tiếng Việt fine-tune
+```powershell
+conda activate LegalAdvisor
+$env:LEGALADVISOR_ENCODER_MAX_SEQ_LENGTH="384"
+python .\scripts\compare_retrieval_models.py \
+  --corpus .\data\processed\zalo-legal\corpus_cleaned.jsonl \
+  --pairs .\data\processed\zalo-legal\train_pairs_enriched.jsonl \
+  --base-model intfloat/multilingual-e5-base \
+  --fine-model-dir .\models\retrieval\vi_legal_ft\best \
+  --output .\results\retrieval\benchmark_base_vs_finetune.json \
+  --batch-size 128 \
+  --top-ks 5,10 \
+  --device cpu \
+  --max-seq-len 384
+```
+
+### 6. Khi nào tăng lên 512 token?
+Tăng nếu recall/MRR cải thiện rõ và tài nguyên cho phép. Điều rất dài nên ưu tiên chiến lược "multi-vector per Điều" (đang lên kế hoạch) thay vì chỉ tăng seq length.

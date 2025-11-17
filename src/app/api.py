@@ -19,6 +19,7 @@ import time
 import threading
 from collections import defaultdict, deque
 from datetime import datetime
+import traceback
 
 # Import logger
 try:
@@ -39,6 +40,13 @@ except ImportError:
 # Import RAG pipeline - Sử dụng GeminiRAG
 import argparse
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+try:
+    # Ưu tiên import tuyệt đối để tránh lỗi 'attempted relative import with no known parent package'
+    from src.rag.gemini_rag import GeminiRAG  # type: ignore
+except ImportError:
+    # Fallback if absolute import fails
+    from ..rag.gemini_rag import GeminiRAG  # type: ignore
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='LegalAdvisor API Server')
@@ -96,7 +104,7 @@ def _init_rag(force: bool = False) -> bool:
             rag_last_error = None
             rag_retry_info["last_success_at"] = rag_retry_info["last_attempt_at"]
             rag_retry_info["last_error"] = None
-            print("🤖 Đã khởi tạo GeminiRAG thành công!")
+            # Only log, don't print to reduce console noise
             logger.info("GeminiRAG initialized successfully")
             return True
         except Exception as e:
@@ -105,7 +113,7 @@ def _init_rag(force: bool = False) -> bool:
             rag_last_error = str(e)
             rag_retry_info["last_error"] = str(e)
             log_error(error_msg)
-            print(f"❌ {error_msg}")
+            # Only log, don't print to reduce console noise
             return False
 
 
@@ -137,7 +145,9 @@ if False:
 class QuestionRequest(BaseModel):
     # Giới hạn chiều dài câu hỏi để tránh lạm dụng (mặc định 1024)
     question: constr(min_length=1, max_length=1024)  # type: ignore
-    # Ràng buộc top_k trong khoảng 1..50
+    # Mức chi tiết: brief | moderate | comprehensive (mặc định: moderate)
+    detail_level: str = "moderate"  # type: ignore
+    # Legacy: giữ để backward compatible (không dùng)
     top_k: conint(ge=1, le=50) = 3  # type: ignore
 
 
@@ -146,8 +156,16 @@ class AnswerResponse(BaseModel):
     answer: str
     confidence: float
     sources: List[Dict[str, Any]]
-    num_sources: int
-    status: str
+    num_sources: int  # Số tài liệu (laws)
+    num_segments_retrieved: int = 0  # Số segments retrieve để scoring (oversample)
+    num_segments: int = 0  # Số segments total (toàn bộ của articles được chọn)
+    num_articles: int = 0  # Số articles được chọn (qua adaptive threshold)
+    sources_grouped: List[Dict[str, Any]] = []
+    num_docs: int = 0  # Alias cho num_sources
+    threshold_used: float = 0.0  # Threshold value áp dụng
+    detail_level: str = "moderate"  # Mức chi tiết được sử dụng
+    status: str = "success"
+    citations: List[Dict[str, Any]] = []
 
 
 # Khởi tạo FastAPI
@@ -178,6 +196,27 @@ class HealthDiagnostics(BaseModel):
     retry_attempts: int
     last_attempt_at: Optional[str]
     last_success_at: Optional[str]
+
+class WarmupResponse(BaseModel):
+    status: str
+    rag_loaded: bool
+    warmed_retrieval: bool
+    warmed_llm: bool
+    message: Optional[str] = None
+
+class CitationContentResponse(BaseModel):
+    act_code: str
+    article: int
+    num_chunks: int
+    items: List[Dict[str, Any]]
+    merged_content: Optional[str] = None
+
+class CitationContentBulkResponse(BaseModel):
+    act_code: str
+    articles: List[int] = []
+    by_article: Dict[str, Optional[str]] = {}
+    merged_combined: Optional[str] = None
+    merged_all: Optional[str] = None
 
 
 @app.get("/", tags=["General"])
@@ -211,6 +250,36 @@ async def health_details():
         last_attempt_at=rag_retry_info.get("last_attempt_at"),
         last_success_at=rag_retry_info.get("last_success_at")
     )
+
+@app.post("/warmup", response_model=WarmupResponse, tags=["Health"], summary="Khởi tạo và làm ấm hệ thống")
+async def warmup(llm: bool = False):
+    """Khởi tạo RAG và chạy một lượt retrieval (và tùy chọn LL.M) để giảm độ trễ lần đầu.
+
+    - llm=False: chỉ warm retrieval (không tốn token Gemini), mặc định.
+    - llm=True: gọi một lượt generate_response với prompt ngắn để warm model (sẽ tốn token).
+    """
+    loaded = _init_rag(force=False)
+    if not loaded or rag_system is None:
+        return WarmupResponse(status="degraded", rag_loaded=False, warmed_retrieval=False, warmed_llm=False, message=rag_last_error)
+
+    warmed_retrieval = False
+    warmed_llm = False
+    try:
+        # Warm retrieval: một lượt search ngắn
+        _ = rag_system.retrieve_documents("khởi tạo hệ thống", top_k=1)
+        warmed_retrieval = True
+    except Exception as e:
+        log_error(f"Warmup retrieval failed: {e}")
+    if llm:
+        try:
+            _ = rag_system.generate_response("Ping", context=None)
+            warmed_llm = True
+        except Exception as e:
+            log_error(f"Warmup LLM failed: {e}")
+    return WarmupResponse(status="ok" if warmed_retrieval or warmed_llm else "degraded",
+                          rag_loaded=True,
+                          warmed_retrieval=warmed_retrieval,
+                          warmed_llm=warmed_llm)
 
 @app.post("/debug/reinit", response_model=HealthResponse, tags=["Health"], summary="Force reinitialize RAG")
 async def force_reinitialize_rag():
@@ -311,24 +380,165 @@ async def ask_question(request: QuestionRequest, _: None = Depends(rate_limit_de
 
     try:
         # Xử lý câu hỏi
-        # Sử dụng GeminiRAG.ask để lấy câu trả lời và nguồn
-        result = rag_system.ask(request.question, top_k=request.top_k or 3)
+        # Sử dụng GeminiRAG.ask với detail_level (brief/moderate/comprehensive)
+        result = rag_system.ask(request.question, detail_level=request.detail_level)
 
         response_time = time.time() - start_time
         log_performance("api_request", response_time, {
             "question": request.question if LOG_QUESTIONS else "[masked]",
             "confidence": float(result.get('confidence', 0.0)),
-            "num_sources": int(result.get('num_sources', 0))
+            "num_sources": int(result.get('num_sources', 0)),  # Số tài liệu (laws)
+            "num_segments": int(result.get('num_segments', 0))  # Số segments tìm được
         })
 
-        # Tạo phản hồi chuẩn hóa, GeminiRAG hiện chưa trả về confidence -> mặc định 0.0
+        # Trích xuất tài liệu trích dẫn (citations) chỉ từ các nguồn thuộc TOP-K tài liệu
+        citations: List[Dict[str, Any]] = []
+        try:
+            # Import chậm để tránh chi phí khởi động
+            from ..retrieval.citation.extract import extract_citations  # type: ignore
+
+            @app.get("/debug/retrieval_test", tags=["Debug"], summary="Chẩn đoán truy hồi thô")
+            async def debug_retrieval_test(q: str, top_k: int = 3):
+                """Trả về kết quả truy hồi thô (không gọi LLM) giúp debug trường hợp num_sources=0.
+
+                Bật ENV `LEGALADVISOR_DEBUG_RETRIEVAL=1` để có thêm log chi tiết.
+                """
+                if rag_system is None:
+                    if not _init_rag():
+                        raise HTTPException(status_code=503, detail="RAG system not available")
+                try:
+                    docs = rag_system.retrieve_documents(q, top_k=top_k)
+                    return {
+                        "query": q,
+                        "top_k": top_k,
+                        "num_results": len(docs),
+                        "scores": [d.get("score", 0.0) for d in docs],
+                        "corpus_ids": [d.get("corpus_id") for d in docs],
+                    }
+                except Exception as e:
+                    return {
+                        "query": q,
+                        "error": str(e),
+                        "trace": traceback.format_exc()
+                    }
+            from ..utils.law_registry import get_registry  # type: ignore
+            reg = None
+            try:
+                reg = get_registry()
+            except Exception:
+                reg = None
+
+            sources = result.get('sources', []) or []
+            # Chỉ cho phép trích dẫn từ các chunk thuộc tài liệu top-k (sources_grouped)
+            allowed_act_codes: set = set()
+            try:
+                for g in (result.get('sources_grouped') or []):
+                    ac = g.get('act_code')
+                    if ac:
+                        allowed_act_codes.add(str(ac))
+            except Exception:
+                allowed_act_codes = set()
+            code_to_articles: Dict[str, set] = {}
+            # Bản đồ: mã văn bản được trích dẫn -> {ref_act_code: {ref_articles: set[int], cited_articles: set[int]}}
+            cited_to_refs: Dict[str, Dict[str, Dict[str, set]]] = {}
+            for s in sources:
+                content = (s.get('content_full') or s.get('content') or None)
+                if not content:
+                    try:
+                        cid = s.get('chunk_id')
+                        if cid is not None and rag_system is not None:
+                            content = rag_system.get_chunk_content(int(cid))
+                    except Exception:
+                        content = None
+                if not content:
+                    continue
+                # Xác định mã văn bản tham khảo (nguồn) tương ứng với chunk hiện tại
+                ref_code_norm: Optional[str] = None
+                ref_article_num: Optional[int] = None
+                try:
+                    corpus_id = str(s.get('corpus_id') or '').strip()
+                    if corpus_id:
+                        raw_code = corpus_id.split('+')[0].strip()
+                        if raw_code:
+                            try:
+                                from ..utils.law_registry import normalize_act_code as _norm  # type: ignore
+                                ref_code_norm = _norm(raw_code)
+                            except Exception:
+                                ref_code_norm = raw_code.upper()
+                        # Lấy Điều (suffix) của văn bản tham chiếu hiện tại nếu có
+                        try:
+                            parts = corpus_id.split('+', 1)
+                            if len(parts) == 2 and parts[1].isdigit():
+                                ref_article_num = int(parts[1])
+                        except Exception:
+                            ref_article_num = None
+                    # Ưu tiên suffix trong field riêng nếu có
+                    if ref_article_num is None:
+                        suf = s.get('suffix')
+                        if suf is not None and str(suf).isdigit():
+                            try:
+                                ref_article_num = int(suf)
+                            except Exception:
+                                ref_article_num = None
+                except Exception:
+                    ref_code_norm = None
+                # Bỏ qua nếu chunk không thuộc các tài liệu top-k
+                if allowed_act_codes and (not ref_code_norm or ref_code_norm not in allowed_act_codes):
+                    continue
+                try:
+                    hits = extract_citations(content, registry=reg, article_only=True)
+                except Exception:
+                    hits = []
+                for h in hits:
+                    if not h.act_code_norm or h.article is None:
+                        continue
+                    code = h.act_code_norm
+                    if code not in code_to_articles:
+                        code_to_articles[code] = set()
+                    code_to_articles[code].add(int(h.article))
+                    if ref_code_norm:
+                        entry = cited_to_refs.setdefault(code, {}).setdefault(ref_code_norm, {"ref_articles": set(), "cited_articles": set()})
+                        # Bổ sung Điều của văn bản THAM CHIẾU (nơi chứa trích dẫn)
+                        if ref_article_num is not None:
+                            entry["ref_articles"].add(int(ref_article_num))
+                        # Ghi nhận Điều của văn bản BỊ TRÍCH DẪN (đã dùng ở phần tiêu đề bên ngoài)
+                        entry["cited_articles"].add(int(h.article))
+
+            for code, arts in code_to_articles.items():
+                # Build supplemented_by list with act_code + articles
+                supplemented_list: List[Dict[str, Any]] = []
+                refs = cited_to_refs.get(code, {}) or {}
+                for ref_code, ref_info in refs.items():
+                    # Trả về các Điều của văn bản tham chiếu (nơi chứa tham chiếu)
+                    ref_arts = sorted([int(a) for a in (ref_info.get("ref_articles") or set())])
+                    supplemented_list.append({
+                        "act_code": ref_code,
+                        "articles": ref_arts,
+                    })
+                citations.append({
+                    "act_code": code,
+                    "articles": sorted(list(arts)),
+                    "supplemented_by": supplemented_list,
+                })
+        except Exception:
+            citations = []
+
+        # Tạo phản hồi chuẩn hóa
         return AnswerResponse(
             question=result.get('question', request.question),
             answer=result.get('answer', ''),
             confidence=float(result.get('confidence', 0.0)),
             sources=result.get('sources', []),
             num_sources=int(result.get('num_sources', 0)),
-            status=result.get('status', 'success')
+            num_segments_retrieved=int(result.get('num_segments_retrieved', 0)),
+            num_segments=int(result.get('num_segments', 0)),
+            num_articles=int(result.get('num_articles', 0)),
+            sources_grouped=result.get('sources_grouped', []),
+            num_docs=int(result.get('num_docs', 0)),
+            threshold_used=float(result.get('threshold_used', 0.0)),
+            detail_level=result.get('detail_level', 'moderate'),
+            status=result.get('status', 'success'),
+            citations=citations,
         )
 
     except Exception as e:
@@ -350,8 +560,7 @@ async def get_stats():
         return {"error": "RAG system not loaded"}
 
     try:
-        # Load metadata để lấy thống kê
-        # Xác định đường dẫn models/retrieval từ root dự án hoặc từ biến môi trường
+        # Load metadata để lấy thống kê (hỗ trợ cấu trúc mới và cũ)
         env_models_dir = os.getenv("LEGALADVISOR_MODELS_DIR")
         if env_models_dir:
             model_dir = Path(env_models_dir)
@@ -359,20 +568,40 @@ async def get_stats():
             current_dir = Path(__file__).resolve().parent  # src/app
             root_dir = current_dir.parent.parent  # -> root
             model_dir = root_dir / "models" / "retrieval"
-        metadata_path = model_dir / "metadata.json"
+        metadata_path_old = model_dir / "metadata.json"
+        metadata_path_new = model_dir / "index" / "metadata.json"
 
-        if metadata_path.exists():
-            with open(metadata_path, 'r', encoding='utf-8') as f:
+        metadata = None
+        if metadata_path_old.exists():
+            with open(metadata_path_old, 'r', encoding='utf-8') as f:
                 metadata = json.load(f)
+        elif metadata_path_new.exists():
+            with open(metadata_path_new, 'r', encoding='utf-8') as f:
+                # metadata mới là dict (tổng quan). Nếu cần chi tiết per-chunk, giữ nguyên lỗi “not found”.
+                try:
+                    metadata = json.load(f)
+                except Exception:
+                    metadata = None
 
+        if isinstance(metadata, list):
             total_chunks = len(metadata)
             total_words = sum(item.get('word_count', 0) for item in metadata)
-
+            model_name = getattr(rag_system, 'model_info', {}).get("model_name", "unknown")
             return {
                 "total_chunks": total_chunks,
                 "total_words": total_words,
                 "avg_words_per_chunk": total_words / total_chunks if total_chunks > 0 else 0,
-                "model_name": rag_system.model_info.get("model_name", "unknown")
+                "model_name": model_name,
+            }
+        elif isinstance(metadata, dict):
+            # metadata mới (tổng quan) có thể chứa total_chunks
+            total_chunks = int(metadata.get("total_chunks", 0))
+            model_name = getattr(rag_system, 'model_info', {}).get("model_name", "unknown")
+            return {
+                "total_chunks": total_chunks,
+                "total_words": None,
+                "avg_words_per_chunk": None,
+                "model_name": model_name,
             }
         else:
             return {"error": "Metadata not found"}
@@ -394,6 +623,111 @@ async def get_source_content(chunk_id: int):
         else:
             raise HTTPException(status_code=404, detail="Chunk not found")
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/citations/content", response_model=CitationContentResponse, tags=["Citations"], summary="Lấy nội dung trích dẫn theo mã văn bản và Điều")
+async def get_citation_content(act_code: str, article: int):
+    """Lấy nội dung các chunk thuộc một Điều trong văn bản được trích dẫn.
+
+    - act_code: mã văn bản (dạng tự nhiên), sẽ được chuẩn hoá về `act_code_norm`.
+    - article: số Điều (int).
+    """
+    if not rag_system:
+        raise HTTPException(status_code=503, detail="RAG system not available")
+    try:
+        try:
+            from ..utils.law_registry import normalize_act_code  # type: ignore
+        except Exception:
+            def normalize_act_code(x: str) -> str:
+                return (x or '').strip().lower()
+
+        code_norm = normalize_act_code(act_code)
+        if not code_norm:
+            raise HTTPException(status_code=400, detail="act_code không hợp lệ")
+
+        retr = getattr(rag_system, 'retriever', None)
+        if retr is None:
+            raise HTTPException(status_code=503, detail="Retriever not available")
+        items = retr.get_article_contents(code_norm, int(article))
+        merged = retr.get_article_text(code_norm, int(article))
+        return {
+            "act_code": code_norm,
+            "article": int(article),
+            "num_chunks": len(items),
+            "items": items,
+            "merged_content": merged,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/citations/content/bulk", response_model=CitationContentBulkResponse, tags=["Citations"], summary="Lấy nội dung trích dẫn hàng loạt theo danh sách Điều")
+async def get_citation_content_bulk(act_code: str, articles: Optional[str] = None):
+    """Trả về nội dung theo nhiều Điều trong một lần gọi. Nếu không truyền `articles`, trả về toàn văn bản.
+
+    - act_code: mã văn bản (chuẩn hóa nội bộ).
+    - articles: chuỗi số cách nhau bằng dấu phẩy, ví dụ: "5,6,7".
+    """
+    if not rag_system:
+        raise HTTPException(status_code=503, detail="RAG system not available")
+    try:
+        try:
+            from ..utils.law_registry import normalize_act_code  # type: ignore
+        except Exception:
+            def normalize_act_code(x: str) -> str:
+                return (x or '').strip().lower()
+
+        code_norm = normalize_act_code(act_code)
+        if not code_norm:
+            raise HTTPException(status_code=400, detail="act_code không hợp lệ")
+        retr = getattr(rag_system, 'retriever', None)
+        if retr is None:
+            raise HTTPException(status_code=503, detail="Retriever not available")
+
+        if not articles:
+            merged_all = retr.get_document_text_all(code_norm)
+            return {
+                "act_code": code_norm,
+                "articles": [],
+                "by_article": {},
+                "merged_combined": merged_all,
+                "merged_all": merged_all,
+            }
+
+        # Parse danh sách Điều
+        try:
+            arts_list = [int(a.strip()) for a in str(articles).split(',') if a.strip().isdigit()]
+        except Exception:
+            arts_list = []
+        if not arts_list:
+            merged_all = retr.get_document_text_all(code_norm)
+            return {
+                "act_code": code_norm,
+                "articles": [],
+                "by_article": {},
+                "merged_combined": merged_all,
+                "merged_all": merged_all,
+            }
+
+        by_article: Dict[str, Optional[str]] = {}
+        sections: List[str] = []
+        for art in arts_list:
+            text = retr.get_article_text(code_norm, int(art))
+            by_article[str(int(art))] = text
+            if text:
+                sections.append(f"Điều {int(art)}\n{text}")
+        merged_combined = "\n\n".join(sections).strip() if sections else None
+        return {
+            "act_code": code_norm,
+            "articles": [int(a) for a in arts_list],
+            "by_article": by_article,
+            "merged_combined": merged_combined,
+            "merged_all": retr.get_document_text_all(code_norm),
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
