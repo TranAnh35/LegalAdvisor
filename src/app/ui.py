@@ -99,10 +99,12 @@ def check_api_health(max_retries=1, timeout=5):
                 break
     return data
 
-def ask_question(question: str, top_k: int = 3) -> Optional[Dict[str, Any]]:
+def ask_question(question: str) -> Optional[Dict[str, Any]]:
     """Gửi câu hỏi đến API"""
     try:
-        payload = {"question": question, "top_k": top_k}
+        # Backend hiện tại không còn sử dụng tham số top_k (đã chuyển sang cơ chế detail_level/adaptive),
+        # nên chỉ gửi question, để slider trên UI không còn cần thiết.
+        payload = {"question": question}
         response = requests.post(f"{API_BASE_URL}/ask", json=payload)
         try:
             data = response.json()
@@ -236,23 +238,13 @@ def main():
         )
         st.session_state["question_input"] = question
 
-        # Settings
-        col_a, col_b = st.columns(2)
-        with col_a:
-            top_k = st.slider(
-                "Số nguồn tài liệu",
-                min_value=1,
-                max_value=10,
-                value=5,
-                help="Tăng số nguồn để thu thập thêm ngữ cảnh khi cần",
-            )
-        with col_b:
-            submit_button = st.button("🔍 Tìm câu trả lời", type="primary", use_container_width=True)
+        # Nút gửi câu hỏi (slider chọn số nguồn tài liệu đã được loại bỏ vì backend không còn sử dụng top_k)
+        submit_button = st.button("🔍 Tìm câu trả lời", type="primary", use_container_width=True)
 
         # Submit
         if submit_button and question.strip():
             with st.spinner("🔄 Đang xử lý câu hỏi..."):
-                result = ask_question(question.strip(), top_k)
+                result = ask_question(question.strip())
                 st.session_state["last_result"] = result
                 # Chuẩn bị sẵn danh sách nguồn hiển thị để lần toggle không phải tính lại
                 prepared_sources = []
@@ -601,7 +593,7 @@ def main():
                 st.session_state["question_input"] = q
                 # Tự động submit câu hỏi mẫu
                 with st.spinner("🔄 Đang xử lý câu hỏi..."):
-                    result = ask_question(q.strip(), top_k=top_k)
+                    result = ask_question(q.strip())
                     st.session_state["last_result"] = result
                     # Prefetch nội dung tài liệu (ưu tiên content_full từ response)
                     try:

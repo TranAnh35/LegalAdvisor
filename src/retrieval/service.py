@@ -35,7 +35,7 @@ class RetrievalService:
     def __init__(self, use_gpu: bool = False) -> None:
         # Thư mục models/retrieval
         self.model_dir: Path = get_models_retrieval_dir()
-        self.index_dir: Path = self.model_dir / "index"
+        self.index_dir: Path = self.model_dir / "index_v2"
         self.use_gpu: bool = bool(use_gpu)
         self._logger = get_logger("legaladvisor.retrieval")
         # Thiết bị mục tiêu cho encoder (GPU nếu được yêu cầu và khả dụng)

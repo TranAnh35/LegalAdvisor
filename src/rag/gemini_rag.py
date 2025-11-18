@@ -306,28 +306,32 @@ class GeminiRAG:
         """
         if not self.retriever:
             return ""
+        # Nới lỏng giới hạn context vì Gemini có context window lớn;
+        # vẫn cho phép cấu hình lại qua ENV nếu cần.
         try:
-            total_budget = int(os.getenv("LEGALADVISOR_CONTEXT_TOTAL_CHARS", "20000"))
+            total_budget = int(os.getenv("LEGALADVISOR_CONTEXT_TOTAL_CHARS", "200000"))
         except Exception:
-            total_budget = 20000
+            total_budget = 200000
         try:
-            per_doc_budget = int(os.getenv("LEGALADVISOR_CONTEXT_DOC_CHARS", "6000"))
+            per_doc_budget = int(os.getenv("LEGALADVISOR_CONTEXT_DOC_CHARS", "40000"))
         except Exception:
-            per_doc_budget = 6000
+            per_doc_budget = 40000
         try:
-            citation_budget = int(os.getenv("LEGALADVISOR_CONTEXT_CITATION_CHARS", "4000"))
+            citation_budget = int(os.getenv("LEGALADVISOR_CONTEXT_CITATION_CHARS", "20000"))
         except Exception:
-            citation_budget = 4000
+            citation_budget = 20000
         try:
-            max_segments_per_article = int(os.getenv("LEGALADVISOR_CONTEXT_MAX_SEGMENTS_PER_ARTICLE", "3"))
+            max_segments_per_article = int(os.getenv("LEGALADVISOR_CONTEXT_MAX_SEGMENTS_PER_ARTICLE", "10"))
         except Exception:
-            max_segments_per_article = 3
+            max_segments_per_article = 10
         if max_segments_per_article <= 0:
-            max_segments_per_article = 3
+            max_segments_per_article = 10
 
         # Map (act_code_norm, Điều) -> chunk_id và danh sách segment part trúng theo score
         article_chunk_ids: Dict[tuple, int] = {}
         article_hit_parts: Dict[tuple, List[int]] = {}
+        # Map act_code_norm -> metadata (type_code, number, year) để hiển thị tiêu đề văn bản thân thiện
+        code_meta: Dict[str, Dict[str, Any]] = {}
         for d in (retrieved_docs or []):
             corpus_id = str(d.get('corpus_id') or '').strip()
             if not corpus_id:
@@ -336,6 +340,18 @@ class GeminiRAG:
             code_norm = normalize_act_code(raw_code) if raw_code else ''
             if not code_norm:
                 continue
+
+            # Thu thập metadata phục vụ hiển thị tên văn bản
+            meta_for_code = code_meta.setdefault(code_norm, {})
+            # type_code: ưu tiên field 'type', fallback raw_code
+            if 'type_code' not in meta_for_code:
+                type_code = (d.get('type') or '') or raw_code
+                meta_for_code['type_code'] = str(type_code) if type_code is not None else ''
+            # number, year: lấy lần đầu tiên nhìn thấy
+            if 'number' not in meta_for_code and d.get('number'):
+                meta_for_code['number'] = str(d.get('number'))
+            if 'year' not in meta_for_code and d.get('year'):
+                meta_for_code['year'] = str(d.get('year'))
             suffix = d.get('suffix')
             art: Optional[int] = None
             if suffix is not None and str(suffix).isdigit():
@@ -422,13 +438,32 @@ class GeminiRAG:
                 logger.warning(f"ThreadPoolExecutor error: {e}")
         
         # 1) Nội dung toàn bộ top-k tài liệu (ưu tiên các Điều/segments đã trúng)
-        parts.append("[Tài liệu tham khảo (toàn văn)]")
+        parts.append("[Tài liệu tham khảo (toàn văn) – đã được hệ thống RAG chọn lọc]")
         for g in (sources_grouped or []):
             if remaining <= 0:
                 break
             code = g.get('act_code') or ''
             articles = g.get('articles') or []
-            header = f"Văn bản `{code}`\n"
+            meta = code_meta.get(code, {})
+            type_code = meta.get('type_code') or ''
+            number = meta.get('number') or ''
+            year = meta.get('year') or ''
+
+            # Xây tên văn bản thân thiện: ví dụ "Luật Doanh nghiệp 2020" hoặc "Nghị định 01/2021/NĐ-CP"
+            law_title = ""
+            if type_code or number:
+                law_title = _vietnamese_doc_title(str(type_code), str(number))
+            code_display = (code or "").replace('_', ' ')
+            if not law_title:
+                law_title = code_display or "Văn bản pháp luật"
+            if year:
+                law_title = f"{law_title} ({year})"
+
+            # Giữ thêm mã act_code (đã bỏ '_' cho dễ đọc) trong ngoặc vuông để LLM dễ trích dẫn, nhưng không yêu cầu in ra nguyên xi
+            if code_display and code_display.lower() not in law_title.lower():
+                header = f"Văn bản: {law_title} [{code_display}]\n"
+            else:
+                header = f"Văn bản: {law_title}\n"
             body_sections: List[str] = []
             used = 0
             if isinstance(articles, list) and len(articles) > 0:
@@ -963,25 +998,38 @@ class GeminiRAG:
 
             # Prepare the prompt
             if context:
-                prompt = f"""
-                Bạn là trợ lý pháp lý tiếng Việt. Trả lời CHỈ dựa vào ngữ cảnh sau.
-                - KHÔNG chèn mã nguồn hay corpus-id vào phần trả lời. KHÔNG dùng ngoặc đơn để liệt kê mã nguồn.
-                - Hạn chế suy diễn. Chỉ khi ngữ cảnh không nêu quy định trực tiếp mới nói "Không đủ căn cứ trong nguồn đã trích" và gợi ý văn bản cần tra thêm.
-                - Câu trả lời ngắn gọn, 3-5 gạch đầu dòng, dùng ngôn ngữ tự nhiên, dễ hiểu.
-
-                Ngữ cảnh (đã kèm corpus-id):
-                {context}
-
-                Câu hỏi: {question}
-                """
+                # Prompt chuyên biệt cho pháp luật Việt Nam, có định dạng rõ ràng cho câu trả lời
+                prompt = (
+                    "Bạn là trợ lý pháp lý tiếng Việt, chuyên phân tích và trích dẫn đúng quy định pháp luật Việt Nam.\n"
+                    "Trả lời CHỈ dựa trên phần 'Ngữ cảnh pháp lý' bên dưới; không sử dụng kiến thức bên ngoài.\n"
+                    "\n"
+                    "YÊU CẦU ĐỊNH DẠNG CÂU TRẢ LỜI:\n"
+                    "1. Dòng đầu tiên: ghi tên văn bản pháp luật chính áp dụng (hoặc 2–3 văn bản chính nếu có nhiều), "
+                    "ví dụ: 'Luật Doanh nghiệp 2020' hoặc 'Luật Doanh nghiệp 2020; Nghị định 01/2021/NĐ-CP'.\n"
+                    "2. Phần 'Tư vấn': trình bày ngắn gọn, dễ hiểu, 3–7 gạch đầu dòng nêu trực tiếp câu trả lời cho người dùng.\n"
+                    "3. Phần 'Căn cứ pháp lý':\n"
+                    "   - Nhóm các trích dẫn theo từng văn bản (Luật/Nghị định/Thông tư/Quyết định…).\n"
+                    "   - Với mỗi văn bản, liệt kê các trích dẫn dạng (Tên văn bản – Điều ? – Khoản ? – Điểm ?).\n"
+                    "   - Nếu không xác định được Khoản/Điểm thì có thể bỏ trống phần đó.\n"
+                    "4. Phần 'Nguồn tài liệu': liệt kê lại các nguồn đã sử dụng; với mỗi nguồn, ghi tên văn bản "
+                    "(hãy thay mọi dấu '_' bằng khoảng trắng để dễ đọc) và tóm tắt rất ngắn (1 câu) nội dung chính.\n"
+                    "5. Không chèn mã nguồn kỹ thuật, id nội bộ, corpus-id, chunk-id… vào câu trả lời.\n"
+                    "6. Nếu ngữ cảnh không đủ căn cứ rõ ràng để trả lời, hãy nêu rõ: "
+                    "\"Không đủ căn cứ trong nguồn đã trích\" và gợi ý thêm văn bản/thuật ngữ nên tra cứu.\n"
+                    "7. Nội dung chỉ mang tính tham khảo, không thay thế ý kiến tư vấn của luật sư hoặc cơ quan nhà nước có thẩm quyền.\n"
+                    "\n"
+                    "Ngữ cảnh pháp lý (các trích đoạn luật, nghị định, thông tư… đã được hệ thống truy xuất):\n"
+                    f"{context}\n\n"
+                    f"Câu hỏi của người dùng: {question}\n"
+                )
             else:
-                prompt = f"""
-                Bạn là một trợ lý pháp lý thông minh. Hãy trả lời câu hỏi sau đây:
-                
-                Câu hỏi: {question}
-                
-                Nếu bạn không chắc chắn về câu trả lời, hãy nói rõ điều đó.
-                """
+                prompt = (
+                    "Bạn là trợ lý pháp lý tiếng Việt, chuyên hỗ trợ tra cứu pháp luật Việt Nam.\n"
+                    "Hãy trả lời ngắn gọn, rõ ràng, dễ hiểu và ưu tiên đưa ra trích dẫn pháp lý khi có thể.\n"
+                    "Nếu bạn không chắc chắn về câu trả lời hoặc không có đủ thông tin, hãy nói rõ điều đó "
+                    "và khuyến nghị người dùng tham khảo luật sư/chuyên gia hoặc cơ quan nhà nước có thẩm quyền.\n"
+                    f"\nCâu hỏi của người dùng: {question}\n"
+                )
             
             # Generate response
             response = self.model.generate_content(prompt)
@@ -1088,12 +1136,14 @@ class GeminiRAG:
             filtered_docs = self._flatten_segments(doc_infos)
             sources_grouped = self._build_sources_grouped(doc_infos)
 
-            # Step 3: Xây dựng context ưu tiên toàn văn top-k doc + tài liệu trích dẫn
+            # Step 3: Xây dựng context ưu tiên toàn văn top-k doc + tài liệu trích dẫn.
+            # Dùng danh sách segments gốc từ bước retrieve để giữ đầy đủ metadata (type, number, year, score...)
+            # nhưng chỉ ghép nội dung cho các văn bản/articles đã được chọn trong sources_grouped.
             context = None
             try:
-                context = self._build_llm_context(filtered_docs or [], sources_grouped or [])
+                context = self._build_llm_context(retrieved_docs or [], sources_grouped or [])
             except Exception:
-                # Fallback an toàn
+                # Fallback an toàn: vẫn cố gắng cung cấp snippet cho LLM
                 context = format_retrieved_docs(filtered_docs) if filtered_docs else None
             
             # Step 4: Generate response using Gemini
