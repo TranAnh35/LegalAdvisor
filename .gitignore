@@ -54,6 +54,10 @@ Thumbs.db
 *.tmp
 *.temp
 
+# Deprecated code (archived for reference)
+# Uncomment to exclude deprecated folder from version control
+# deprecated/
+
 # Model files (optional - comment out if you want to commit models)
 # models/
 # !models/.gitkeep

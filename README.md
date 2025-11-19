@@ -1,163 +1,171 @@
-# ⚖️ LegalAdvisor
+# ⚖️ LegalAdvisor v1.0
 
-LegalAdvisor là một hệ thống **Hỏi – Đáp pháp luật bằng tiếng Việt**, được xây dựng trên nền tảng **NLP + LLM**.  
-Dự án được thực hiện trong khuôn khổ môn học **Xử lý ngôn ngữ tự nhiên (NLP)**.  
+**LegalAdvisor** là trợ lý pháp lý AI thông minh dành cho người Việt, kết hợp công nghệ **Retrieval-Augmented Generation (RAG)** tiên tiến để trả lời câu hỏi pháp luật một cách chính xác, có trích dẫn nguồn cụ thể.
 
----
-
-## 🚀 Mục tiêu
-- Trả lời câu hỏi pháp luật tiếng Việt dựa trên dữ liệu luật.  
-- Kết hợp **Retrieval-Augmented Generation (RAG)** để vừa chính xác, vừa mượt mà.  
-- Hỗ trợ người dùng tham khảo luật một cách dễ dàng.  
+Dự án được xây dựng hoàn thiện, sẵn sàng triển khai và sử dụng.
 
 ---
 
-## 🗂️ Dataset
-- **ViQuAD** → dùng để train QA Reader.  
-- **ViLegalText** → tập văn bản luật, dùng cho Retrieval corpus.  
+## 🌟 Tính năng nổi bật
+
+- **Hỏi đáp pháp luật tự nhiên**: Trả lời câu hỏi dựa trên ngữ cảnh luật pháp Việt Nam.
+- **Trích dẫn chính xác**: Mọi câu trả lời đều kèm theo nguồn dẫn cụ thể (Điều, Khoản, Văn bản luật).
+- **Truy hồi thông minh**:
+  - **Semantic Search**: Sử dụng mô hình **`intfloat/multilingual-e5-small`** đã được fine-tune chuyên biệt cho pháp luật Việt Nam.
+  - **Phân đoạn thông minh**: Xử lý văn bản luật dài thành các đoạn nhỏ (chunks) tối ưu cho việc tìm kiếm.
+- **Giao diện trực quan**:
+  - **Web UI**: Giao diện Chat thân thiện (Streamlit).
+  - **API RESTful**: Endpoint đầy đủ cho tích hợp hệ thống khác (FastAPI).
+- **Hiệu năng cao**: Hỗ trợ tăng tốc GPU, caching thông minh và tối ưu hóa độ trễ.
 
 ---
 
-## 🛠️ Kiến trúc hệ thống
-1. **Retrieval**: FAISS/ElasticSearch để tìm văn bản luật liên quan.  
-2. **Reader**: PhoBERT fine-tuned trên ViQuAD để trích xuất câu trả lời.  
-3. **LLM Post-processing**: GPT/LLaMA để sinh câu trả lời tự nhiên.  
-4. **UI Demo**: FastAPI + Streamlit.  
+## 🛠️ Yêu cầu hệ thống
+
+- **OS**: Windows
+- **Python**: 3.11+
+- **Conda**: Khuyến nghị sử dụng để quản lý môi trường.
+- **API Key**: Cần có **Google Gemini API Key** (miễn phí hoặc trả phí).
 
 ---
 
-## 📅 Roadmap (2 tháng)
-- Tuần 1–2: Chuẩn bị & tiền xử lý dữ liệu.  
-- Tuần 3–4: Train Retrieval + Reader.  
-- Tuần 5–6: Tích hợp LLM (RAG pipeline).  
-- Tuần 7: Xây dựng API + UI.  
-- Tuần 8: Báo cáo + Demo.  
+## ⚡ Cài đặt & Chạy chương trình
 
----
+### 1. Thiết lập môi trường
 
-## 📂 Cấu trúc repo
-Xem chi tiết trong phần `tree` ở trên.
-
----
-
-## ⚡ Hướng dẫn cài đặt
 ```bash
-git clone https://github.com/username/LegalAdvisor.git
-cd LegalAdvisor
-
-# Tạo môi trường conda
-conda create -n LegalAdvisor python=3.8
+# Tạo và kích hoạt môi trường conda
+conda create -n LegalAdvisor python=3.11
 conda activate LegalAdvisor
 
-# Cài đặt dependencies
+# Cài đặt thư viện
 pip install -r requirements.txt
 ```
 
-### 🚀 GPU Support (Khuyến nghị)
+### 2. Cấu hình API Key
 
-LegalAdvisor hỗ trợ **GPU acceleration** để tăng hiệu suất lên đến **15x**!
+Bạn cần thiết lập biến môi trường `GOOGLE_API_KEY` để sử dụng mô hình Gemini.
 
-#### Kiểm tra GPU
+**Windows (PowerShell):**
+```powershell
+$env:GOOGLE_API_KEY = "AIzaSy..."
+```
+
+**Linux/macOS:**
 ```bash
-python check_gpu.py
+export GOOGLE_API_KEY="AIzaSy..."
 ```
 
-#### Cài đặt GPU (Tùy chọn)
-Xem hướng dẫn chi tiết trong [README_GPU.md](docs/README_GPU.md)
+### 3. Khởi chạy hệ thống (All-in-One)
 
-**Yêu cầu**: NVIDIA GPU với CUDA 11.8+ và 8GB VRAM
+Sử dụng script `launcher.py` để tự động kiểm tra hệ thống và khởi chạy cả API lẫn giao diện Web.
 
-**Lợi ích**:
-- ⚡ Xử lý câu hỏi chỉ trong **1-2 giây** thay vì 10-15 giây
-- 🎯 Embedding nhanh hơn 20x
-- 🤖 Generation nhanh hơn 10x
-- 🔍 Search nhanh hơn 30x
-
-# Setup Google Gemini
-# Tạo file .env và thêm GOOGLE_API_KEY; xem [GEMINI_SETUP.md](docs/GEMINI_SETUP.md)
-```
-
-## 🚀 Chạy demo nhanh
-```bash
-# Yêu cầu: đặt GOOGLE_API_KEY để sử dụng Gemini
-# PowerShell (Windows):
-$env:GOOGLE_API_KEY = "<your_key_here>"
-python launcher.py
-```
-
-## ▶️ Chạy từng phần
-### 1. Chuẩn bị dữ liệu
-```bash
-# Tải ViQuAD (hoặc tạo mock nếu không tải được)
-python -m src.tools.data_tools download-viquad
-
-# Xử lý VNLegalText → tạo smart_chunks_stable.db/parquet
-python src/automatic_preprocess_vnlegaltext_stable.py
-
-# Tạo FAISS index
-python src/retrieval/build_index.py
-```
-
-### 2. Test retrieval
-```bash
-python src/retrieval/search.py
-```
-
-### 3. Chạy hệ thống
-#### Cách 1: Chạy tự động (Khuyến nghị)
 ```bash
 python launcher.py
 ```
 
-#### Cách 2: Chạy riêng lẻ
-##### Backend (FastAPI)
+Sau khi khởi động thành công:
+- **Giao diện Chat (Web UI)**: [http://localhost:8501](http://localhost:8501)
+- **API Backend**: [http://localhost:8000](http://localhost:8000)
+- **Tài liệu API (Swagger)**: [http://localhost:8000/docs](http://localhost:8000/docs)
+
+---
+
+## 🧠 Quy trình Huấn luyện & Cập nhật Dữ liệu
+
+Dưới đây là hướng dẫn đầy đủ để tái tạo lại hệ thống từ dữ liệu gốc (Raw Data) đến khi có Index và Model hoàn chỉnh.
+
+### Bước 1: Tải dữ liệu gốc (Download)
+
+Tải dataset Zalo Legal từ Hugging Face về thư mục `data/raw`.
+
 ```bash
-# PowerShell (Windows): đảm bảo có GOOGLE_API_KEY
-$env:GOOGLE_API_KEY = "<your_key_here>"
-python src/app/api.py
-# hoặc
-uvicorn src.app.api:app --host 0.0.0.0 --port 8000 --reload
+python scripts/zalo_legal_download.py
+```
+*Kết quả: Dữ liệu thô được lưu tại `data/raw/zalo_ai_legal_text_retrieval/`.*
+
+### Bước 2: Tiền xử lý dữ liệu (Preprocessing)
+
+Thực hiện chuẩn hóa Unicode, tạo schema chuẩn và làm giàu dữ liệu train.
+
+1. **Chuẩn hóa Corpus cho ứng dụng (Application Schema):**
+   ```bash
+   python -m src.data_preprocessing.zalo_legal
+   ```
+   *Tạo: `data/processed/zalo-legal/chunks_schema.jsonl`*
+
+2. **Chuẩn hóa Corpus cho huấn luyện (Unicode Fix):**
+   ```bash
+   python scripts/normalize_zalo_corpus.py
+   ```
+   *Tạo: `data/processed/zalo-legal/corpus_cleaned.jsonl`*
+
+3. **Xử lý cặp câu hỏi - văn bản (Pairs Enrichment):**
+   ```bash
+   python scripts/build_enriched_pairs.py
+   ```
+   *Tạo: `queries_dedup.jsonl` và `train_pairs_enriched.jsonl`*
+
+### Bước 3: Tạo dữ liệu huấn luyện (Hard Negatives)
+
+Sử dụng BM25 để tìm các văn bản "gây nhiễu" (hard negatives) giúp model học tốt hơn.
+
+```bash
+python scripts/build_triplets.py
+```
+*Kết quả: `data/processed/zalo-legal/triplets_train.jsonl`*
+
+### Bước 4: Huấn luyện Model Retrieval
+
+Fine-tune mô hình `intfloat/multilingual-e5-small` trên dữ liệu luật Việt Nam.
+
+```bash
+python scripts/train_retrieval.py \
+  --base-model intfloat/multilingual-e5-small \
+  --output-dir models/retrieval/vi_legal_finetuned \
+  --batch-size 32 \
+  --epochs 4
+```
+*Kết quả: Model mới được lưu tại `models/retrieval/vi_legal_finetuned`.*
+
+### Bước 5: Xây dựng Index tìm kiếm (Build Index)
+
+Tạo FAISS Index từ model đã fine-tune để sử dụng trong ứng dụng.
+
+```bash
+python src/retrieval/build_index.py \
+  --chunks data/processed/zalo-legal/chunks_schema.jsonl \
+  --model-dir models/retrieval/vi_legal_finetuned \
+  --output-dir models/retrieval/index_v2
 ```
 
-##### UI (Streamlit)
+**Lưu ý:** Sau khi chạy xong Bước 5, hệ thống khi chạy `launcher.py` sẽ tự động nhận diện index mới trong `models/retrieval/index_v2`.
+
+---
+
+## 📂 Cấu trúc dữ liệu & Model
+
+Hệ thống sử dụng bộ dữ liệu **Zalo Legal** đã được chuẩn hóa:
+
+- **Lưu trữ**: `data/processed/zalo-legal/chunks_schema.jsonl` (JSONL format).
+- **Index**: FAISS Index (`models/retrieval/index_v2`) sử dụng model `intfloat/multilingual-e5-small` (fine-tuned).
+
+---
+
+## 🔍 Hướng dẫn sử dụng nâng cao
+
+### Chạy riêng lẻ từng thành phần
+
+**Chạy API Server:**
+```bash
+python -m src.app.api
+```
+
+**Chạy Giao diện Web:**
 ```bash
 streamlit run src/app/ui.py
 ```
 
-#### Cách 3: Dừng servers
-```bash
-# Đơn giản: Chỉ cần nhấn Ctrl+C trong terminal
-# Hệ thống sẽ tự động dừng tất cả servers
-```
+## 🤝 Đóng góp
 
-### 📊 Kết quả đạt được
-
-✅ **Đã hoàn thành:**
-- Pipeline RAG với retrieval và generation
-- FAISS index cho 29,234 document chunks
-- Fine-tuned QA model trên dataset ViQuAD
-- FastAPI backend với logging và monitoring
-- Streamlit UI với giao diện thân thiện
-- Unit tests và comprehensive logging
-- **Launcher đơn giản** - khởi động/dừng servers dễ dàng
-- **Signal handling tốt** - dừng với Ctrl+C
-- **Health check tự động** - đảm bảo API sẵn sàng trước khi khởi động UI
-- Tích hợp Google Gemini (tùy chọn)
-
-## 🎯 Tính năng chính
-
-- **Hỏi đáp pháp luật** bằng tiếng Việt
-- **Retrieval-Augmented Generation (RAG)**
-- **Tìm kiếm ngữ nghĩa** trong 12.8M từ văn bản luật
-- **API RESTful** với FastAPI
-- **Giao diện web** với Streamlit
-- **Logging và monitoring** đầy đủ
-- **Unit tests** và validation
-
-## 📈 Metrics
-
-- **29,234 chunks** văn bản pháp luật
-- **12.8 triệu từ** đã xử lý
-- **Retrieval accuracy**: ~70-80% relevant results
-- **Response time**: < 2 giây per query
-- **Model size**: ~500MB (FAISS + transformers)
+Dự án đã hoàn thiện phiên bản v1.0. Mọi đóng góp vui lòng xem tại [CONTRIBUTING.md](docs/CONTRIBUTING.md).

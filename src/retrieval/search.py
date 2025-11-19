@@ -14,7 +14,7 @@ from sentence_transformers import SentenceTransformer
 import faiss
 import sqlite3
 import pandas as pd
-from retrieval.service import RetrievalService
+from .service import RetrievalService
 
 class LegalRetriever:
     """Class để retrieval văn bản pháp luật (sử dụng RetrievalService)."""
@@ -22,7 +22,6 @@ class LegalRetriever:
     def __init__(self, use_gpu: bool = False):
         self.service = RetrievalService(use_gpu=use_gpu)
         self.model_info = self.service.model_info
-        self.metadata = self.service.metadata
 
         print(f"✅ LegalRetriever loaded!")
         print(f"   - Model: {self.model_info['model_name']}")
@@ -34,41 +33,13 @@ class LegalRetriever:
 
         # Delegate cho service
         results = self.service.retrieve(query, top_k=top_k)
-        # Rút gọn schema cho script test
-        simplified = [{
-            'chunk_id': r.get('chunk_id'),
-            'doc_file': r.get('doc_file'),
-            'chunk_index': self.service._meta_by_id.get(int(r.get('chunk_id', -1)), {}).get('chunk_index') if r.get('chunk_id') is not None else None,
-            'score': r.get('score', 0.0),
-            'word_count': self.service._meta_by_id.get(int(r.get('chunk_id', -1)), {}).get('word_count') if r.get('chunk_id') is not None else None
-        } for r in results]
-
-        return simplified
+        # Trả về kết quả trực tiếp (đã có đầy đủ metadata)
+        return results
 
     def get_chunk_content(self, chunk_id):
         """Lấy nội dung chunk theo ID từ SQLite/Parquet"""
+        # Dùng service thống nhất (JSONL schema mới)
         return self.service.get_chunk_content(int(chunk_id))
-        try:
-            processed_dir = Path(__file__).resolve().parent.parent.parent / "data" / "processed"
-            sqlite_path = processed_dir / 'smart_chunks_stable.db'
-            parquet_path = processed_dir / 'smart_chunks_stable.parquet'
-
-            if sqlite_path.exists():
-                conn = sqlite3.connect(str(sqlite_path))
-                cur = conn.cursor()
-                cur.execute("SELECT content FROM chunks WHERE chunk_id=?", (int(chunk_id),))
-                row = cur.fetchone()
-                conn.close()
-                return row[0] if row and row[0] else None
-
-            if parquet_path.exists():
-                df = pd.read_parquet(parquet_path)
-                match = df.loc[df['chunk_id'] == int(chunk_id), 'content']
-                if not match.empty:
-                    return str(match.iloc[0])
-        except Exception:
-            return None
-        return None
 
 def test_retrieval():
     """Test retrieval system"""
@@ -96,9 +67,9 @@ def test_retrieval():
 
         # Hiển thị kết quả
         for i, result in enumerate(results, 1):
-            print(f"{i}. File: {result['doc_file']}")
-            print(f"   Score: {result['score']:.4f}")
-            print(f"   Words: {result['word_count']}")
+            print(f"{i}. Corpus ID: {result.get('corpus_id', 'N/A')}")
+            print(f"   Score: {result.get('score', 0.0):.4f}")
+            print(f"   Type: {result.get('type', 'N/A')} | Number: {result.get('number', 'N/A')}")
 
             # Lấy và hiển thị nội dung mẫu
             content = retriever.get_chunk_content(result['chunk_id'])

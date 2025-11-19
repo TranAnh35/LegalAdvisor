@@ -10,15 +10,11 @@ import subprocess
 import time
 from pathlib import Path
 from dotenv import load_dotenv
+import json
 
 def check_requirements():
     """Kiểm tra các yêu cầu cơ bản"""
     print("🔍 Kiểm tra yêu cầu hệ thống...")
-
-    # Kiểm tra Python version
-    if sys.version_info < (3, 8):
-        print(f"❌ Cần Python >= 3.8, hiện tại: {sys.version}")
-        return False
 
     # Kiểm tra GPU và hiển thị thông tin
     print("🔥 Kiểm tra GPU support...")
@@ -44,12 +40,10 @@ def check_requirements():
             Path(dir_path).mkdir(parents=True, exist_ok=True)
             print(f"✅ Đã tạo thư mục: {dir_path}")
 
-    # Kiểm tra dataset
+    # Kiểm tra dataset (ưu tiên pipeline mới Zalo-Legal)
     dataset_files = [
-        # Chuẩn: dữ liệu đã xử lý ở SQLite/Parquet
-        "data/processed/smart_chunks_stable.db",
-        "data/processed/smart_chunks_stable.parquet",
-        "data/raw/ViQuAD/train.json"
+        # Dữ liệu đã tiền xử lý cho pipeline mới
+        "data/processed/zalo-legal/chunks_schema.jsonl"
     ]
 
     missing_datasets = []
@@ -58,13 +52,66 @@ def check_requirements():
             missing_datasets.append(file_path)
 
     if missing_datasets:
-        print("⚠️ Thiếu datasets:")
+        print("ℹ️  Chưa tìm thấy dữ liệu đã tiền xử lý cho pipeline Zalo-Legal:")
         for missing in missing_datasets:
             print(f"   - {missing}")
-        print("💡 Chạy preprocessing để tạo datasets:")
-        print("   python src/automatic_preprocess_vnlegaltext_stable.py  # tạo smart_chunks_stable.db/parquet")
-        print("   python src/download_viquad.py")
-        print("   python src/split_datasets.py")
+        print("   → Hãy chạy: python scripts/zalo_legal_preprocess.py (sau khi đã download)")
+
+    # Kiểm tra mô hình retrieval đã sẵn sàng chưa (hỗ trợ index_v2, index và cấu trúc cũ)
+    retrieval_dir = Path("models/retrieval")
+    index_candidates = [
+        ("index_v2", retrieval_dir / "index_v2"),
+        ("index", retrieval_dir / "index"),
+    ]
+    selected_index = None
+    for label, base_dir in index_candidates:
+        idx_path = base_dir / "chunks_index.faiss"
+        info_path = base_dir / "model_info.json"
+        meta_path = base_dir / "metadata.json"
+        if base_dir.exists() and idx_path.exists() and info_path.exists():
+            selected_index = {
+                "label": label,
+                "base_dir": base_dir,
+                "index_path": idx_path,
+                "info_path": info_path,
+                "meta_path": meta_path,
+            }
+            break
+
+    # Cấu trúc cũ (1 file index + 1 model_info)
+    old_index_path = retrieval_dir / "faiss_index.bin"
+    old_info_path = retrieval_dir / "model_info.json"
+    old_meta_path = retrieval_dir / "metadata.json"
+
+    has_new = selected_index is not None
+    has_old = retrieval_dir.exists() and old_index_path.exists() and old_info_path.exists()
+
+    if not has_new and not has_old:
+        print("⚠️  Thiếu mô hình retrieval (FAISS/metadata/model_info).")
+        print("   💡 Vui lòng chạy riêng bước build index trước khi launch:")
+        print("      conda activate LegalAdvisor")
+        print("      python src/retrieval/build_index.py")
+    else:
+        # Ưu tiên đọc model_info theo cấu trúc mới
+        info_path = selected_index["info_path"] if has_new else old_info_path
+        try:
+            with open(info_path, 'r', encoding='utf-8') as f:
+                mi = json.load(f)
+            model_name = mi.get('model_name')
+            dim = mi.get('embedding_dim')
+            metric = mi.get('metric_type', 'ip')
+            pooling = mi.get('pooling', 'unknown')
+            location = f"{selected_index['label']}/" if has_new else "legacy/"
+            print(f"🔧 Retrieval model: {model_name} | dim={dim} | metric={metric} | pooling={pooling} ({location})")
+        except Exception:
+            print("ℹ️  Không đọc được model_info.json để hiển thị thông tin mô hình.")
+        # Cảnh báo nhẹ nếu thiếu metadata (chỉ ảnh hưởng endpoint /stats)
+        if has_new:
+            meta_exists = selected_index["meta_path"].exists()
+        else:
+            meta_exists = old_meta_path.exists()
+        if not meta_exists:
+            print("ℹ️  Chưa tìm thấy metadata.json (chỉ ảnh hưởng thống kê /stats).")
 
     print("✅ Kiểm tra hoàn thành!")
     return True
@@ -108,6 +155,8 @@ def start_api_server(use_gpu=False):
         if not env.get("GOOGLE_API_KEY"):
             raise RuntimeError("GOOGLE_API_KEY chưa được thiết lập. Vui lòng tạo .env và đặt GOOGLE_API_KEY.")
         env["RAG_ENGINE"] = "gemini"
+        # Truyền hint sử dụng GPU cho các tiến trình con
+        env["LEGALADVISOR_USE_GPU"] = "1" if use_gpu else "0"
         api_process = subprocess.Popen(cmd, env=env)
         print("✅ API server đã khởi động (PID: {})".format(api_process.pid))
 
@@ -132,7 +181,8 @@ def start_ui_server():
             "--server.headless", "true"
         ]
 
-        ui_process = subprocess.Popen(cmd)
+        env = os.environ.copy()
+        ui_process = subprocess.Popen(cmd, env=env)
         print("✅ UI server đã khởi động (PID: {})".format(ui_process.pid))
 
     except Exception as e:
@@ -180,22 +230,36 @@ def signal_handler(signum, frame):
 
 def main():
     """Hàm chính"""
+    # Nạp .env sớm để các ENV như GOOGLE_API_KEY/LEGALADVISOR_* có hiệu lực
+    try:
+        load_dotenv()
+    except Exception:
+        pass
     print("\n" + "="*50)
     print("   🏛️  LegalAdvisor - Hệ thống hỗ trợ pháp lý")
-    print("   🚀 Phiên bản: 2.0 (Gemini Integration)")
     print("="*50 + "\n")
     
-    # Kiểm tra xem có GPU không
+    # Kiểm tra xem có cờ ép buộc sử dụng CPU hay không (env override)
     use_gpu = False
-    try:
-        import torch
-        if torch.cuda.is_available():
+    env_override = os.environ.get("LEGALADVISOR_USE_GPU")
+    if env_override is not None:
+        # Accept common truthy/falsy values
+        if env_override.lower() in ("1", "true", "yes", "on"):
             use_gpu = True
-            print("✅ Đã phát hiện GPU, sẽ sử dụng GPU để tăng tốc xử lý")
+            print("✅ LEGALADVISOR_USE_GPU env override: bật GPU")
         else:
-            print("ℹ️  Không phát hiện GPU, sẽ sử dụng CPU")
-    except ImportError:
-        print("⚠️  Không thể kiểm tra GPU do chưa cài đặt PyTorch")
+            use_gpu = False
+            print("✅ LEGALADVISOR_USE_GPU env override: tắt GPU (sử dụng CPU)")
+    else:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                use_gpu = True
+                print("✅ Đã phát hiện GPU, sẽ sử dụng GPU để tăng tốc xử lý")
+            else:
+                print("ℹ️  Không phát hiện GPU, sẽ sử dụng CPU")
+        except ImportError:
+            print("⚠️  Không thể kiểm tra GPU do chưa cài đặt PyTorch")
     print("🤖 Sử dụng Google Gemini cho text generation (bắt buộc)")
 
     # Setup signal handlers
@@ -226,6 +290,7 @@ def main():
             if api_process and api_process.poll() is not None:
                 print("❌ API server đã dừng trong quá trình khởi động. Vui lòng xem logs hiển thị từ API.")
                 print("💡 Gợi ý: kiểm tra GOOGLE_API_KEY, thư mục models/retrieval và kết nối internet.")
+                print("   → Nếu cần xây lại index: python src/retrieval/build_index.py")
                 sys.exit(1)
 
             try:
@@ -243,6 +308,7 @@ def main():
             if elapsed >= max_wait_seconds:
                 print("❌ Không thể kết nối API trong 60 giây.")
                 print("💡 Gợi ý: kiểm tra GOOGLE_API_KEY, thư mục models/retrieval và logs của API.")
+                print("   → Nếu thiếu index: python src/retrieval/build_index.py")
                 break
             time.sleep(1)
 

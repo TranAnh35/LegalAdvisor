@@ -24,6 +24,7 @@ def setup_logger(name: str = "legaladvisor", log_file: str = None, level: int = 
     # Tạo logger
     logger = logging.getLogger(name)
     logger.setLevel(level)
+    logger.propagate = False
 
     # Định dạng log
     formatter = logging.Formatter(
@@ -32,10 +33,15 @@ def setup_logger(name: str = "legaladvisor", log_file: str = None, level: int = 
     )
 
     # Handler cho console
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(level)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+    has_console_handler = any(
+        isinstance(handler, logging.StreamHandler) and getattr(handler, "stream", None) is sys.stdout
+        for handler in logger.handlers
+    )
+    if not has_console_handler:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(level)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
     # Handler cho file (nếu có)
     if log_file:
@@ -43,10 +49,15 @@ def setup_logger(name: str = "legaladvisor", log_file: str = None, level: int = 
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
-        file_handler.setLevel(level)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        has_file_handler = any(
+            isinstance(handler, logging.FileHandler) and Path(getattr(handler, 'baseFilename', '')) == log_path
+            for handler in logger.handlers
+        )
+        if not has_file_handler:
+            file_handler = logging.FileHandler(log_file, encoding='utf-8')
+            file_handler.setLevel(level)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
 
     return logger
 
@@ -66,10 +77,10 @@ def log_function_call(func_name: str, args: dict = None, start_time: float = Non
     else:
         logger.info(f"Calling {func_name}")
 
-    if start_time:
+    if start_time is not None:
         import time
         duration = time.time() - start_time
-        logger.info(".2f")
+        logger.info(f"{func_name} completed in {duration:.2f}s")
 
 def log_error(error_msg: str, exc_info: bool = True):
     """Log error message"""
@@ -78,7 +89,7 @@ def log_error(error_msg: str, exc_info: bool = True):
 def log_performance(operation: str, duration: float, metadata: dict = None):
     """Log performance metrics"""
 
-    msg = ".2f"
+    msg = f"{operation} took {duration:.2f}s"
     if metadata:
         msg += f" - Metadata: {metadata}"
 
@@ -97,11 +108,11 @@ def log_execution(func):
         try:
             result = func(*args, **kwargs)
             duration = time.time() - start_time
-            logger.info(".2f")
+            logger.info(f"{func_name} completed in {duration:.2f}s")
             return result
         except Exception as e:
             duration = time.time() - start_time
-            logger.error(".2f")
+            logger.error(f"{func_name} failed after {duration:.2f}s", exc_info=True)
             raise e
 
     return wrapper
