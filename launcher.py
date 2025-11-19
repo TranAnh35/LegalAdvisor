@@ -57,19 +57,33 @@ def check_requirements():
             print(f"   - {missing}")
         print("   → Hãy chạy: python scripts/zalo_legal_preprocess.py (sau khi đã download)")
 
-    # Kiểm tra mô hình retrieval đã sẵn sàng chưa (hỗ trợ cấu trúc mới và cũ)
+    # Kiểm tra mô hình retrieval đã sẵn sàng chưa (hỗ trợ index_v2, index và cấu trúc cũ)
     retrieval_dir = Path("models/retrieval")
-    index_dir = retrieval_dir / "index"
-    # Cấu trúc mới
-    new_index_path = index_dir / "chunks_index.faiss"
-    new_info_path = index_dir / "model_info.json"
-    new_meta_path = index_dir / "metadata.json"
-    # Cấu trúc cũ
+    index_candidates = [
+        ("index_v2", retrieval_dir / "index_v2"),
+        ("index", retrieval_dir / "index"),
+    ]
+    selected_index = None
+    for label, base_dir in index_candidates:
+        idx_path = base_dir / "chunks_index.faiss"
+        info_path = base_dir / "model_info.json"
+        meta_path = base_dir / "metadata.json"
+        if base_dir.exists() and idx_path.exists() and info_path.exists():
+            selected_index = {
+                "label": label,
+                "base_dir": base_dir,
+                "index_path": idx_path,
+                "info_path": info_path,
+                "meta_path": meta_path,
+            }
+            break
+
+    # Cấu trúc cũ (1 file index + 1 model_info)
     old_index_path = retrieval_dir / "faiss_index.bin"
     old_info_path = retrieval_dir / "model_info.json"
     old_meta_path = retrieval_dir / "metadata.json"
 
-    has_new = retrieval_dir.exists() and new_index_path.exists() and new_info_path.exists()
+    has_new = selected_index is not None
     has_old = retrieval_dir.exists() and old_index_path.exists() and old_info_path.exists()
 
     if not has_new and not has_old:
@@ -79,7 +93,7 @@ def check_requirements():
         print("      python src/retrieval/build_index.py")
     else:
         # Ưu tiên đọc model_info theo cấu trúc mới
-        info_path = new_info_path if has_new else old_info_path
+        info_path = selected_index["info_path"] if has_new else old_info_path
         try:
             with open(info_path, 'r', encoding='utf-8') as f:
                 mi = json.load(f)
@@ -87,12 +101,16 @@ def check_requirements():
             dim = mi.get('embedding_dim')
             metric = mi.get('metric_type', 'ip')
             pooling = mi.get('pooling', 'unknown')
-            location = "index/" if has_new else "legacy/"
+            location = f"{selected_index['label']}/" if has_new else "legacy/"
             print(f"🔧 Retrieval model: {model_name} | dim={dim} | metric={metric} | pooling={pooling} ({location})")
         except Exception:
             print("ℹ️  Không đọc được model_info.json để hiển thị thông tin mô hình.")
         # Cảnh báo nhẹ nếu thiếu metadata (chỉ ảnh hưởng endpoint /stats)
-        if not (new_meta_path.exists() or old_meta_path.exists()):
+        if has_new:
+            meta_exists = selected_index["meta_path"].exists()
+        else:
+            meta_exists = old_meta_path.exists()
+        if not meta_exists:
             print("ℹ️  Chưa tìm thấy metadata.json (chỉ ảnh hưởng thống kê /stats).")
 
     print("✅ Kiểm tra hoàn thành!")

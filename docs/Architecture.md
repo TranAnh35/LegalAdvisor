@@ -1,91 +1,94 @@
 # Kiến trúc hệ thống LegalAdvisor
 
-LegalAdvisor hiện thực hoá pipeline Retrieval-Augmented Generation (RAG) để trả lời câu hỏi pháp luật tiếng Việt. Tài liệu này mô tả các thành phần chính, luồng xử lý và cách dữ liệu được tổ chức trong dự án.
+Tài liệu này mô tả kiến trúc kỹ thuật của **LegalAdvisor v1.0**, hệ thống RAG (Retrieval-Augmented Generation) chuyên biệt cho pháp luật Việt Nam.
 
-## Nguyên tắc thiết kế
-- **Tách chức năng rõ ràng**: Retrieval, sinh câu trả lời và giao diện được tách thành các module riêng.
-- **Triển khai đơn giản**: `launcher.py` gom logic kiểm tra môi trường, khởi động API + UI và giám sát health-check.
-- **Cấu hình linh hoạt**: Mọi đường dẫn và hành vi quan trọng đều có thể điều chỉnh qua biến môi trường.
-- **Khả năng mở rộng**: Có thể thay thế hoặc bổ sung mô hình generator mà không ảnh hưởng tới API/UI.
+## 1. Tổng quan hệ thống
 
-## Luồng xử lý truy vấn
+Hệ thống hoạt động theo mô hình **Client-Server**, tích hợp các thành phần xử lý ngôn ngữ tự nhiên hiện đại:
+
 ```mermaid
-sequenceDiagram
-    participant User as Người dùng (Streamlit UI)
-    participant UI as `src/app/ui.py`
-    participant API as `src/app/api.py`
-    participant RAG as `src/rag/gemini_rag.py`
-    participant RET as `src/retrieval/service.py`
-    participant Store as FAISS + Metadata + Content Store
-    participant Gemini as Google Gemini API
-
-    User->>UI: Nhập câu hỏi pháp luật
-    UI->>API: POST /ask {question, top_k}
-    API->>RAG: `GeminiRAG.ask()`
-    RAG->>RET: `RetrievalService.retrieve()`
-    RET->>Store: Tra FAISS index + metadata
-    Store-->>RET: Danh sách chunk & thông tin pháp lý
-    RET-->>RAG: Context đã chuẩn hóa
-    RAG->>Gemini: Prompt chứa câu hỏi + context
-    Gemini-->>RAG: Văn bản trả lời kèm trích dẫn
-    RAG-->>API: Answer + nguồn + thống kê
-    API-->>UI: JSON response
-    UI-->>User: Hiển thị câu trả lời, độ tin cậy, nguồn
+graph TD
+    User[Người dùng] -->|Tương tác| UI["Web UI (Streamlit)"]
+    UI -->|REST API| API["Backend API (FastAPI)"]
+    
+    subgraph "RAG Core Engine"
+        API -->|Query| RAG[RAG Controller]
+        RAG -->|Search| Ret[Retrieval Service]
+        RAG -->|Context| LLM[Google Gemini]
+    end
+    
+    subgraph "Data & Models"
+        Ret -->|Query Emb| Encoder[SentenceTransformer]
+        Ret -->|Search| FAISS[Vector Index]
+        Ret -->|Lookup| DB[JSONL Storage]
+    end
+    
+    LLM -->|Answer| RAG
+    RAG -->|Response| API
+    API -->|JSON| UI
 ```
-## Thành phần chính
-- **`src/retrieval/service.py` – RetrievalService***
-  - Nạp FAISS index (`models/retrieval/faiss_index.bin`) và metadata (`metadata.json`).
-  - Mã hoá truy vấn bằng SentenceTransformer (hỗ trợ GPU qua `LEGALADVISOR_USE_GPU`).
-  - Lấy nội dung pháp luật từ `data/processed/smart_chunks_stable.db` hoặc `smart_chunks_stable.parquet`.
-- **`src/rag/gemini_rag.py` – GeminiRAG***
-  - Gọi `RetrievalService`, format lại ngữ cảnh (Điều/Khoản/Điểm) và gửi prompt tới `gemini-2.0-flash-exp`.
-  - Ghép block “Tài liệu tham khảo” theo thứ tự nguồn trả về.
-- **`src/app/api.py` – FastAPI backend***
-  - Cung cấp endpoints: `/health`, `/health/details`, `/ask`, `/stats`, `/sources/{chunk_id}`, `/debug/reinit`.
-  - Áp dụng rate limit dựa trên `LEGALADVISOR_RATE_LIMIT_MAX` & `LEGALADVISOR_RATE_LIMIT_WINDOW`.
-- **`src/app/ui.py` – Streamlit UI***
-  - Kiểm tra health API trước khi cho phép đặt câu hỏi.
-  - Cho phép xem nội dung chi tiết từng nguồn qua `/sources/{chunk_id}`.
-- **`launcher.py` – Orchestrator***
-  - Kiểm tra môi trường (Python, GPU, dữ liệu, index) và khởi động API + UI trong hai tiến trình.
-  - Đợi `/health` sẵn sàng, hiển thị điểm truy cập và xử lý tín hiệu dừng.
 
-## Cấu trúc thư mục trọng yếu
+## 2. Luồng xử lý dữ liệu (Data Pipeline)
+
+Dữ liệu pháp luật trải qua quy trình xử lý nghiêm ngặt trước khi đưa vào hệ thống:
+
+1.  **Raw Data (Zalo Legal)**: Dữ liệu thô từ cuộc thi Zalo AI Challenge.
+2.  **Preprocessing (`src/data_preprocessing`)**:
+    *   Làm sạch văn bản, chuẩn hóa unicode.
+    *   Trích xuất metadata (Số hiệu, Loại văn bản, Cơ quan ban hành).
+3.  **Chunking**: Chia nhỏ văn bản theo cấp độ **Điều luật** (Article-level chunking). Đây là đơn vị ngữ nghĩa tốt nhất cho pháp luật.
+4.  **Embedding & Indexing**:
+    *   Sử dụng mô hình `SentenceTransformer` (mặc định: `intfloat/multilingual-e5-small` fine-tuned) để chuyển text thành vector.
+    *   Lưu trữ vector vào **FAISS Index** (`models/retrieval/index_v2`).
+    *   Lưu trữ nội dung text vào **JSONL** (`data/processed/zalo-legal/chunks_schema.jsonl`).
+
+## 3. Chi tiết các thành phần
+
+### A. Retrieval Service (`src/retrieval`)
+Chịu trách nhiệm tìm kiếm các văn bản luật liên quan nhất.
+*   **Input**: Câu hỏi của người dùng.
+*   **Process**:
+    1.  Mã hóa câu hỏi thành vector.
+    2.  Tìm kiếm K vector gần nhất trong FAISS.
+    3.  Map từ ID vector sang nội dung văn bản luật đầy đủ từ JSONL storage.
+    4.  Sử dụng thuật toán tối ưu bộ nhớ (loading indexed cache) để truy xuất cực nhanh (O(1)).
+
+### B. RAG Engine (`src/rag`)
+Bộ não của hệ thống, kết hợp thông tin tìm kiếm được để sinh câu trả lời.
+*   **Model**: Google Gemini (Flash/Pro variants).
+*   **Logic**:
+    *   Xây dựng Prompt chứa: Vai trò chuyên gia pháp lý + Câu hỏi + Các đoạn luật tìm thấy (Context).
+    *   Yêu cầu model trả lời dựa *chỉ* trên context được cung cấp để tránh ảo giác (hallucination).
+    *   Format đầu ra kèm trích dẫn nguồn.
+
+### C. API Backend (`src/app/api.py`)
+*   Framework: **FastAPI**.
+*   Tính năng:
+    *   Rate Limiting (chống spam).
+    *   Logging & Monitoring.
+    *   Endpoints: `/ask` (hỏi đáp), `/sources/{id}` (xem nguồn), `/health` (kiểm tra hệ thống).
+
+## 4. Cấu trúc thư mục
+
 ```text
 LegalAdvisor/
-data/
-    processed/
-        smart_chunks_stable.db
-        smart_chunks_stable.parquet
-models/
-    retrieval/
-        faiss_index.bin
-        metadata.json
-        model_info.json
-src/
-    app/
-    rag/
-    retrieval/
-    utils/
-tests/
-    test_rate_limit.py
-launcher.py
-docs/
+├── data/                   # Dữ liệu
+│   └── processed/
+│       └── zalo-legal/     # Dữ liệu đã xử lý (JSONL + Schema)
+├── models/                 # Models & Index
+│   └── retrieval/
+│       └── index_v2/       # FAISS Index & Metadata
+├── src/                    # Source code chính
+│   ├── app/                # API & UI
+│   ├── rag/                # Logic RAG & Gemini
+│   ├── retrieval/          # Logic tìm kiếm & Embedding
+│   └── utils/              # Tiện ích chung
+├── scripts/                # Các script công cụ (benchmark, test)
+├── tests/                  # Unit & Integration tests
+└── launcher.py             # Script khởi động hệ thống
 ```
-## Biến môi trường & cấu hình chính
-- `GOOGLE_API_KEY`: Bắt buộc để API có thể khởi tạo Gemini.
-- `LEGALADVISOR_USE_GPU`: `1` để cho phép sử dụng GPU trong retrieval/embedding.
-- `LEGALADVISOR_MODELS_DIR`: Ghi đè đường dẫn `models/retrieval/` (dùng khi triển khai tách rời).
-- `LEGALADVISOR_DATA_DIR`: Ghi đè thư mục chứa dữ liệu `data/processed/`.
-- `LEGALADVISOR_RATE_LIMIT_MAX` & `LEGALADVISOR_RATE_LIMIT_WINDOW`: Điều chỉnh rate limit.
-- `LEGALADVISOR_SKIP_RAG_INIT`: `1` để bỏ qua khởi tạo nền khi chạy test.
 
-## Quy trình cập nhật dữ liệu/index
-1. **Chuẩn bị dữ liệu**: Cập nhật `smart_chunks_stable.db` hoặc `smart_chunks_stable.parquet` trong `data/processed/`.
-2. **Xây index mới**: Chạy `python src/retrieval/build_index.py` (có thể bật GPU).
-3. **Triển khai**: Sao chép `faiss_index.bin`, `metadata.json`, `model_info.json` mới vào `models/retrieval/` trước khi khởi động API/UI.
+## 5. Mở rộng & Bảo trì
 
-## Giám sát & kiểm thử
-- **Health-check**: `/health` và `/health/details` phản ánh trạng thái khởi tạo GeminiRAG.
-- **Logging**: `src/utils/logger.py` ghi log định dạng thống nhất vào `logs/legaladvisor_YYYYMMDD.log`.
-- **Testing**: Chạy `pytest` để xác nhận cơ chế rate limit và chuẩn bị mở rộng test trong tương lai.
+*   **Cập nhật dữ liệu**: Chỉ cần chạy lại pipeline tiền xử lý và script `build_index.py` để cập nhật luật mới.
+*   **Thay đổi Model**: Hệ thống thiết kế dạng modular, dễ dàng thay thế SentenceTransformer hoặc LLM khác (như OpenAI, Anthropic) mà không ảnh hưởng logic cốt lõi.

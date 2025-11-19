@@ -35,7 +35,7 @@ def test_rate_limit_enforced(monkeypatch):
     response = client.post("/ask", json={"question": "Test", "top_k": 1})
     assert response.status_code == 429
     data = response.json()
-    assert data.get("message") == "Rate limit exceeded"
+    assert data.get("detail", {}).get("message") == "Rate limit exceeded"
 
     time.sleep(api.RATE_LIMIT_WINDOW)
     response = client.post("/ask", json={"question": "Test", "top_k": 1})
