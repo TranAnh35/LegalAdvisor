@@ -62,8 +62,17 @@ Thumbs.db
 # models/
 # !models/.gitkeep
 
+*.zip
+
 data/
+data_1/
+
+report/
+results/
 
 .cursor/
 .windsurf/
 .github/
+
+.models/
+models/
