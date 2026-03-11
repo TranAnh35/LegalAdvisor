@@ -28,6 +28,15 @@ from .build_index import _get_segment_config, _get_tokenizer, segment_text_for_r
 from ..utils.logger import get_logger
 from ..utils.paths import get_models_retrieval_dir, get_processed_data_dir
 
+# Lazy import to avoid circular dependency issues at module level
+_HierarchyReranker = None
+def _get_hierarchy_reranker_class():
+    global _HierarchyReranker
+    if _HierarchyReranker is None:
+        from .hierarchy_reranker import HierarchyReranker
+        _HierarchyReranker = HierarchyReranker
+    return _HierarchyReranker
+
 
 class RetrievalService:
     """Dịch vụ truy hồi tài liệu dựa trên FAISS + metadata (Zalo-Legal)."""
@@ -235,6 +244,20 @@ class RetrievalService:
         # Performance gain: O(n) scan → O(1) lookup per chunk_id
         self._all_records_cached: bool = False
         self._load_indexed_records_on_init()
+
+        # ===== Hierarchy Reranker (optional) =====
+        self._hierarchy_reranker = None
+        self._hierarchy_rerank_enabled: bool = (
+            os.getenv("LEGALADVISOR_HIERARCHY_RERANK", "1").strip() in ("1", "true", "yes", "on")
+        )
+        if self._hierarchy_rerank_enabled:
+            try:
+                RerankerClass = _get_hierarchy_reranker_class()
+                self._hierarchy_reranker = RerankerClass()
+                self._logger.info("HierarchyReranker enabled")
+            except Exception as exc:
+                self._logger.warning("Failed to initialize HierarchyReranker: %s", exc)
+                self._hierarchy_reranker = None
 
     @staticmethod
     def _normalize_lookup_code(value: str) -> str:
@@ -512,8 +535,30 @@ class RetrievalService:
                     }
                 )
 
-            # Sắp xếp theo doc_score giảm dần và cắt top_k Điều
+            # Sắp xếp theo doc_score giảm dần
             articles.sort(key=lambda r: r.get("score", 0.0), reverse=True)
+
+            # === Hierarchy Reranking (nếu enabled) ===
+            if self._hierarchy_reranker is not None:
+                try:
+                    # Oversample: đưa nhiều candidates hơn vào reranker
+                    rerank_pool = articles[:max(doc_k * 3, 15)]
+                    articles_reranked = self._hierarchy_reranker.rerank(
+                        candidates=rerank_pool,
+                        query=query,
+                        top_k=doc_k,
+                    )
+                    if articles_reranked:
+                        # Cập nhật score chính thức bằng hierarchy_score
+                        for art in articles_reranked:
+                            if "hierarchy_score" in art:
+                                art["score"] = art["hierarchy_score"]
+                        return articles_reranked
+                except Exception as exc:
+                    self._logger.warning(
+                        "HierarchyReranker failed, falling back to original: %s", exc
+                    )
+
             sliced = articles[:doc_k]
             return sliced
         except Exception as e:

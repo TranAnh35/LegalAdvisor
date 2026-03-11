@@ -1,22 +1,14 @@
 """
-Data Preprocessing Module - LegalAdvisor
+Data Preprocessing Module - LegalAdvisor (HyperbolicRAG)
 
-This module handles preprocessing of legal document data for the LegalAdvisor system.
+This module handles preprocessing of legal document data for HyperbolicRAG.
 
-Currently supports:
-- Zalo-AI-Legal corpus preprocessing
+Main script: scripts/process_dataset.py
+
+Outputs:
+- data/processed/zalo-legal/corpus_hyperbolic.jsonl
+- data/processed/zalo-legal/hierarchy.json
+- data/processed/zalo-legal/chunk_depths.json
 """
 
-from .zalo_legal import (
-    parse_corpus_id,
-    preprocess_corpus,
-    load_and_parse_corpus,
-    save_schema_jsonl
-)
-
-__all__ = [
-    'parse_corpus_id',
-    'preprocess_corpus',
-    'load_and_parse_corpus',
-    'save_schema_jsonl'
-]
+__all__ = []

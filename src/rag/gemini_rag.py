@@ -13,16 +13,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np  # type: ignore
 
 from dotenv import load_dotenv
-from ..retrieval.service import RetrievalService
+from ..retrieval.orchestrator import RetrievalOrchestrator
 from ..utils.law_registry import normalize_act_code  # type: ignore
 
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 def _vietnamese_doc_title(type_code: str, number: str) -> str:
-    """Chuyển type+number thành tên văn bản thân thiện.
-    Ví dụ: ttlt-bca-btp-vksndtc-tandtc + 13/2012 ->
-    "Thông tư liên tịch 13/2012/TTLT-BCA-BTP-VKSNDTC-TANDTC"
-    """
+    """Chuyển type+number thành tên văn bản thân thiện."""
     if not type_code:
         return number or "Văn bản pháp luật"
     code = (type_code or '').lower()
@@ -55,9 +52,7 @@ def format_retrieved_docs(docs: List[Dict[str, Any]]) -> str:
         dieu = f"Điều {suffix}" if str(suffix).isdigit() else ''
 
         law_title = _vietnamese_doc_title(type_code, number)
-
         content = (doc.get('content_full') or doc.get('content') or '').strip()
-        # Hiển thị thân thiện: thay '_' bằng ' ' trong nội dung tham chiếu
         snippet = content.replace('_', ' ')
 
         formatted_docs.append(
@@ -85,9 +80,9 @@ class GeminiRAG:
         _logger.info("GeminiRAG initialized successfully")
     
     def _initialize_retriever(self):
-        """Initialize unified RetrievalService"""
+        """Initialize unified RetrievalOrchestrator acting as Service"""
         try:
-            self.retriever = RetrievalService(use_gpu=self.use_gpu)
+            self.retriever = RetrievalOrchestrator(use_gpu=self.use_gpu)
             # Mirror thông tin phục vụ /stats
             self.model_info = getattr(self.retriever, 'model_info', {})
             self.metadata = getattr(self.retriever, 'metadata', {})

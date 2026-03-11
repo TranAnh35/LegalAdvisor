@@ -6,16 +6,16 @@ Chào mừng bạn đến với LegalAdvisor! Dưới đây là các quy tắc q
 
 Code được tổ chức trong thư mục `src/` theo các **module chức năng**:
 
-*   `src/retrieval/`: Logic tìm kiếm, đánh chỉ mục (Indexing) và mã hóa văn bản.
+*   `src/retrieval/`: Logic tìm kiếm gồm Euclidean/Hyperbolic Services, Orchestrator và Hierarchical Reranker.
 *   `src/rag/`: Pipeline RAG, tích hợp LLM (Gemini) để sinh câu trả lời.
 *   `src/app/`: Chứa API Backend (FastAPI) và Giao diện Frontend (Streamlit).
-*   `src/utils/`: Các hàm tiện ích dùng chung (logger, path helper...).
-*   `src/data_preprocessing/`: Script xử lý dữ liệu thô.
+*   `src/utils/`: Các hàm tiện ích dùng chung (logger, config.py tập trung...).
+*   `src/data_preprocessing/`: Script biến đổi dữ liệu, xây dựng cây Hierarchy và ETL.
 
 **Lưu ý**:
 *   Dữ liệu đặt trong `data/` (chia thành `raw/` và `processed/`).
 *   Notebook nghiên cứu đặt trong `notebooks/`.
-*   Các script chạy một lần hoặc benchmark đặt trong `scripts/`.
+*   Các script chạy một lần, huấn luyện mô hình Dual-Space (training/) hoặc đánh giá (evaluation/) đặt trong `scripts/`.
 
 ---
 
@@ -66,8 +66,8 @@ Code được tổ chức trong thư mục `src/` theo các **module chức năn
 
 ## 4. ⚙️ Cấu hình & Môi trường
 
-*   **Environment Variables**: Sử dụng file `.env` để quản lý cấu hình (API Key, đường dẫn model, tham số hệ thống).
-*   **Không Hard-code**: Tuyệt đối không hard-code đường dẫn tuyệt đối hoặc API Key trong code. Sử dụng `os.getenv()` hoặc `pathlib`.
+*   **Environment Variables**: Sử dụng file `.env` kết hợp với module **`src/utils/config.py`** để quản lý cấu hình tập trung (Hyperbolic Flags, API Keys, Context Limits).
+*   **Không Hard-code**: Tuyệt đối không hard-code đường dẫn tuyệt đối hoặc đọc biến qua `os.getenv` rải rác. Gọi trực tiếp thông qua class `Config` (`Config.get_str(...)`).
 
 ---
 

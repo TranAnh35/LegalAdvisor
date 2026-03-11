@@ -1,10 +1,11 @@
 # Kiến trúc hệ thống LegalAdvisor
 
-Tài liệu này mô tả kiến trúc kỹ thuật của **LegalAdvisor v1.0**, hệ thống RAG (Retrieval-Augmented Generation) chuyên biệt cho pháp luật Việt Nam.
+Tài liệu này mô tả kiến trúc kỹ thuật của **LegalAdvisor v1.0**, hệ thống RAG (Retrieval-Augmented Generation) chuyên biệt cho pháp luật Việt Nam. 
+Phiên bản hiện tại đã được nâng cấp lên kiến trúc **HyperbolicRAG Dual-Space** để bắt chính xác cấu trúc phân cấp (Hierarchy) của văn bản luật.
 
 ## 1. Tổng quan hệ thống
 
-Hệ thống hoạt động theo mô hình **Client-Server**, tích hợp các thành phần xử lý ngôn ngữ tự nhiên hiện đại:
+Hệ thống hoạt động theo mô hình **Client-Server**, sử dụng mô hình Giao thoa Không gian (Dual-Space Mutual Ranking Fusion) hiện đại:
 
 ```mermaid
 graph TD
@@ -12,83 +13,87 @@ graph TD
     UI -->|REST API| API["Backend API (FastAPI)"]
     
     subgraph "RAG Core Engine"
-        API -->|Query| RAG[RAG Controller]
-        RAG -->|Search| Ret[Retrieval Service]
-        RAG -->|Context| LLM[Google Gemini]
+        API -->|Query| RAG[GeminiRAG]
+        RAG -->|Search| Orch[Retrieval Orchestrator]
+        RAG -->|Context| LLM[Google Gemini 2.5]
     end
     
-    subgraph "Data & Models"
-        Ret -->|Query Emb| Encoder[SentenceTransformer]
-        Ret -->|Search| FAISS[Vector Index]
-        Ret -->|Lookup| DB[JSONL Storage]
+    subgraph "Dual-Space Retrieval"
+        Orch -->|Config: Euclidean| EucSer[Euclidean Service]
+        Orch -->|Config: Hyperbolic| HypSer[Hyperbolic Service]
+        
+        EucSer -->|Encode| E5[E5 Encoder]
+        E5 -->|L2 Search| FAISS[FAISS Vector Index]
+        
+        HypSer -->|Encode| Poincare[Hyperbolic Encoder]
+        Poincare -->|Geodesic Search| Numpy[Numpy Poincaré Array]
+        
+        FAISS -.->|Results| Fusion[Mutual Ranking Fusion]
+        Numpy -.->|Results| Fusion
+        
+        Fusion -->|Top-K| Reranker[Hierarchical Reranker]
+        EucSer -.->|Fallback| Reranker
     end
     
-    LLM -->|Answer| RAG
-    RAG -->|Response| API
+    Reranker -->|Final Docs| RAG
+    LLM -->|Answer| API
     API -->|JSON| UI
 ```
 
 ## 2. Luồng xử lý dữ liệu (Data Pipeline)
 
-Dữ liệu pháp luật trải qua quy trình xử lý nghiêm ngặt trước khi đưa vào hệ thống:
+Dữ liệu pháp luật trải qua quy trình xử lý trước khi đưa vào hệ thống:
 
-1.  **Raw Data (Zalo Legal)**: Dữ liệu thô từ cuộc thi Zalo AI Challenge.
-2.  **Preprocessing (`src/data_preprocessing`)**:
-    *   Làm sạch văn bản, chuẩn hóa unicode.
-    *   Trích xuất metadata (Số hiệu, Loại văn bản, Cơ quan ban hành).
-3.  **Chunking**: Chia nhỏ văn bản theo cấp độ **Điều luật** (Article-level chunking). Đây là đơn vị ngữ nghĩa tốt nhất cho pháp luật.
-4.  **Embedding & Indexing**:
-    *   Sử dụng mô hình `SentenceTransformer` (mặc định: `intfloat/multilingual-e5-small` fine-tuned) để chuyển text thành vector.
-    *   Lưu trữ vector vào **FAISS Index** (`models/retrieval/index_v2`).
-    *   Lưu trữ nội dung text vào **JSONL** (`data/processed/zalo-legal/chunks_schema.jsonl`).
+1.  **Raw Data**: Dữ liệu thô từ Zalo AI Legal.
+2.  **Preprocessing (`src/data_preprocessing/`)**:
+    *   Làm sạch và chia nhỏ (Chunking) theo cấp độ **Điều luật**.
+    *   Xây dựng cây phân cấp (Hierarchy Tree) từ Văn Bản -> Chương -> Mục -> Điều.
+3.  **Embedding & Indexing (Dual-Space)**:
+    *   **Euclidean Space**: Dùng `intfloat/multilingual-e5-small` đổi text thành Vector tĩnh, nhúng vào FAISS.
+    *   **Hyperbolic Space (Mới)**: Đồ thị hoá vector tĩnh thông qua Neural Network dự đoán Depth (độ sâu) và chọc vào Poincaré Ball bảo toàn cấu trúc bao hàm.
+4.  **Retrieval Phase**:
+    *   Thực hiện truy vấn trên 2 không gian độc lập. Khoảng cách Geodesic (arccosh) được tính trên Hyperbolic nhằm giải bài toán bão hoà điểm ảnh của FAISS L2.
+    *   **MRF (Mutual Ranking Fusion)**: Trộn kết quả ở 2 không gian sinh *Consistency Bonus*.
+    *   **Hierarchy Reranker**: Điều chỉnh điểm số sau chót nhằm phục vụ câu hỏi Tổng Quát vs Cụ Thể dựa trên `chunk_depths`. 
 
 ## 3. Chi tiết các thành phần
 
-### A. Retrieval Service (`src/retrieval`)
-Chịu trách nhiệm tìm kiếm các văn bản luật liên quan nhất.
-*   **Input**: Câu hỏi của người dùng.
-*   **Process**:
-    1.  Mã hóa câu hỏi thành vector.
-    2.  Tìm kiếm K vector gần nhất trong FAISS.
-    3.  Map từ ID vector sang nội dung văn bản luật đầy đủ từ JSONL storage.
-    4.  Sử dụng thuật toán tối ưu bộ nhớ (loading indexed cache) để truy xuất cực nhanh (O(1)).
+### A. Retrieval Orchestrator (`src/retrieval/orchestrator.py`)
+Mặt tiền (Facade) điều phối phương thức tìm kiếm. Tự động chuyển đổi giữa `EuclideanRetrievalService` (chế độ thường) và `HyperbolicRetrievalService` (chế độ sâu) thông qua biến môi trường.
 
-### B. RAG Engine (`src/rag`)
-Bộ não của hệ thống, kết hợp thông tin tìm kiếm được để sinh câu trả lời.
-*   **Model**: Google Gemini (Flash/Pro variants).
+### B. Mạng Neural Poincaré (`src/retrieval/hyperbolic/`)
+* **Encoder**: Ánh xạ đặc trưng Euclidean sang mặt phẳng cong Hyperbolic thông qua `geoopt.expmap0`.
+* **Loss Function**: `HierarchicalContrastiveLoss`. Học tính bao hàm (Parent-Child) bằng Margin Triplet Loss. 
+* **Metric Search**: Vectorized Numpy Arccosh cực nhanh. Thay thế hoàn toàn thuật toán L2 của FAISS.
+
+### C. RAG Engine (`src/rag/`)
+*   **Model**: Google Gemini API.
 *   **Logic**:
-    *   Xây dựng Prompt chứa: Vai trò chuyên gia pháp lý + Câu hỏi + Các đoạn luật tìm thấy (Context).
-    *   Yêu cầu model trả lời dựa *chỉ* trên context được cung cấp để tránh ảo giác (hallucination).
-    *   Format đầu ra kèm trích dẫn nguồn.
+    *   Xây dựng Prompt qua `_build_llm_context`. Fetch song song nội dung Top K văn bản luật qua ThreadPool.
+    *   Ép Gemini bám vào Căn Cứ Pháp Lý, trích xuất chính xác nguồn dẫn chứng cho Frontend hiển thị.
 
-### C. API Backend (`src/app/api.py`)
-*   Framework: **FastAPI**.
-*   Tính năng:
-    *   Rate Limiting (chống spam).
-    *   Logging & Monitoring.
-    *   Endpoints: `/ask` (hỏi đáp), `/sources/{id}` (xem nguồn), `/health` (kiểm tra hệ thống).
+### D. Centralized Config (`src/utils/config.py`)
+* Loại bỏ toàn bộ hardcode `os.getenv`. 
+* Quy hoạch cấu hình của Rate-limiter, Context Size, Hyperbolic Flag,... một cách nhất quán tại 1 điểm.
 
 ## 4. Cấu trúc thư mục
 
 ```text
 LegalAdvisor/
-├── data/                   # Dữ liệu
-│   └── processed/
-│       └── zalo-legal/     # Dữ liệu đã xử lý (JSONL + Schema)
-├── models/                 # Models & Index
+├── data/                   # Dữ liệu (Raw + Processed)
+├── models/                 # Chứa Weights & Indexes
 │   └── retrieval/
-│       └── index_v2/       # FAISS Index & Metadata
+│       ├── index_v2/           # FAISS Index (Euclidean)
+│       ├── index_hyperbolic/   # Numpy Index (Poincaré)
+│       └── hyperbolic_encoder/ # PyTorch Hyperbolic Weights
 ├── src/                    # Source code chính
-│   ├── app/                # API & UI
-│   ├── rag/                # Logic RAG & Gemini
-│   ├── retrieval/          # Logic tìm kiếm & Embedding
-│   └── utils/              # Tiện ích chung
-├── scripts/                # Các script công cụ (benchmark, test)
-├── tests/                  # Unit & Integration tests
-└── launcher.py             # Script khởi động hệ thống
+│   ├── app/                # API (FastAPI) & UI (Streamlit)
+│   ├── data_preprocessing/ # ETL Logic, Build Hierarchy
+│   ├── rag/                # Gemini Integration, Prompt Builder
+│   ├── retrieval/          # Orchestrator, Dual-Space Services
+│   │   └── hyperbolic/     # Core thuật toán Non-Euclidean Geometry
+│   └── utils/              # Cấu hình Global & Helpers
+├── scripts/                
+│   └── training/           # Scripts Huấn luyện mô hình
+└── launcher.py             # Script khởi động all-in-one
 ```
-
-## 5. Mở rộng & Bảo trì
-
-*   **Cập nhật dữ liệu**: Chỉ cần chạy lại pipeline tiền xử lý và script `build_index.py` để cập nhật luật mới.
-*   **Thay đổi Model**: Hệ thống thiết kế dạng modular, dễ dàng thay thế SentenceTransformer hoặc LLM khác (như OpenAI, Anthropic) mà không ảnh hưởng logic cốt lõi.

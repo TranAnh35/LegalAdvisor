@@ -10,9 +10,11 @@ Dự án được xây dựng hoàn thiện, sẵn sàng triển khai và sử d
 
 - **Hỏi đáp pháp luật tự nhiên**: Trả lời câu hỏi dựa trên ngữ cảnh luật pháp Việt Nam.
 - **Trích dẫn chính xác**: Mọi câu trả lời đều kèm theo nguồn dẫn cụ thể (Điều, Khoản, Văn bản luật).
-- **Truy hồi thông minh**:
-  - **Semantic Search**: Sử dụng mô hình **`intfloat/multilingual-e5-small`** đã được fine-tune chuyên biệt cho pháp luật Việt Nam.
-  - **Phân đoạn thông minh**: Xử lý văn bản luật dài thành các đoạn nhỏ (chunks) tối ưu cho việc tìm kiếm.
+- **Truy hồi thông minh (HyperbolicRAG)**:
+  - **Dual-Space Search**: Tích hợp không gian Euclidean (FAISS) và không gian cong Hyperbolic (Poincaré Ball) bằng Mutual Ranking Fusion để giải bài toán phân cấp luật pháp.
+  - **Hierarchical Reranking**: Tái xếp hạng kết quả thông minh dựa vào độ sâu (Tổng quát vs Điều khoản cụ thể) của văn bản.
+  - **Semantic Search**: Sử dụng mô hình **`intfloat/multilingual-e5-small`** đã được fine-tune chuyên biệt.
+  - **Phân đoạn thông minh**: Xử lý văn bản luật dài thành các đoạn nhỏ (chunks) theo cấp độ Điều.
 - **Giao diện trực quan**:
   - **Web UI**: Giao diện Chat thân thiện (Streamlit).
   - **API RESTful**: Endpoint đầy đủ cho tích hợp hệ thống khác (FastAPI).
@@ -165,6 +167,12 @@ python -m src.app.api
 ```bash
 streamlit run src/app/ui.py
 ```
+
+### Biến Môi trường Nâng cao (HyperbolicRAG Config)
+
+Hệ thống cung cấp cơ chế tinh chỉnh hành vi của Retrieval Backend linh hoạt thông qua các file/biến cấu hình chung ở `src/utils/config.py`:
+- `LEGALADVISOR_USE_HYPERBOLIC="1"` Bật hoặc Tắt luồng chạy **Tìm kiếm Dual-Space Hyperbolic**. Đòi hỏi phải train Model mạng HyperbolicEncoder trước.
+- `LEGALADVISOR_HIERARCHY_RERANK="1"` Bật bộ hậu kiểm duyệt điểm thông minh (Hoạt động tốt cả khi tắt Dual-Space).
 
 ## 🤝 Đóng góp
 
