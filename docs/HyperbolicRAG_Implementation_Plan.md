@@ -84,6 +84,13 @@
 - [x] Task 4.3: Integrate với GeminiRAG
 - [x] Task 4.4: Testing và benchmarking
 
+### Phase 5: Comprehensive Data Crawling & Optimization
+**Mục tiêu:** Xây dựng hệ thống Crawler tự động lấy toàn văn pháp luật, đồng thời tinh gọn Data Schema loại bỏ các trường dự phòng của hệ thống RAG cũ.
+**Tasks:**
+- [ ] Task 5.1: Xây dựng Crawler phân rã toàn văn (Full-text) từ Thư Viện Pháp Luật / Cổng TTĐT Chính Phủ.
+- [ ] Task 5.2: Chuẩn hoá Data Schema hướng Hyperbolic (Xoá bỏ reference cứng trong content).
+- [ ] Task 5.3: Cập nhật luồng Pipeline xây dựng Hierarchy và JSONL mới nhất.
+
 ---
 
 ## 3. Chi tiết Triển khai

@@ -76,3 +76,15 @@ results/
 
 .models/
 models/ 
+
+# Scrapy HTTP Cache - tốn hàng chục GB, không commit
+scripts/crawl/legal_crawler/.scrapy_cache/
+scripts/crawl/legal_crawler/.scrapy/
+
+# Database SQLite - lưu cục bộ, không commit
+data/database/*.db
+data/database/*.db-shm
+data/database/*.db-wal
+
+# File log từ Scrapy test runs
+scripts/crawl/legal_crawler/*.txt
