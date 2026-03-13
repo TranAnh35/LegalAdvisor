@@ -7,6 +7,7 @@ Saves the geometries to models/retrieval/index_hyperbolic/embeddings.npy
 """
 
 import os
+import sys
 import json
 import numpy as np
 import torch
@@ -14,6 +15,11 @@ import torch.nn as nn
 from sentence_transformers import SentenceTransformer
 from pathlib import Path
 from tqdm import tqdm
+
+# Đảm bảo Python có thể import được module `src` khi chạy lệnh từ bash/cmd/colab
+project_root = Path(__file__).resolve().parent.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
 from src.retrieval.hyperbolic.encoder import HyperbolicEncoder
 from src.utils.paths import get_processed_data_dir, get_models_retrieval_dir
@@ -50,7 +56,7 @@ def build_hyperbolic_index():
     hyperbolic_proj.eval()
     
     # Read Corpus
-    chunks_path = processed_dir / "zalo-legal" / "chunks_schema.jsonl"
+    chunks_path = processed_dir / "zalo-legal" / "corpus_hyperbolic.jsonl"
     print(f"Reading corpus {chunks_path}...")
     
     chunk_ids = []

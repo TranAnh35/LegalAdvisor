@@ -223,9 +223,9 @@ class RetrievalService:
                 self._logger.warning("Không thể chuyển encoder sang GPU (%s), fallback dùng CPU", exc)
                 self._device = "cpu"
 
-        # Đường dẫn JSONL content store (schema mới)
+        # Đường dẫn JSONL content store (schema mới - corpus_hyperbolic)
         self.processed_dir: Path = get_processed_data_dir()
-        self.jsonl_path: Path = self.processed_dir / "zalo-legal" / "chunks_schema.jsonl"
+        self.jsonl_path: Path = self.processed_dir / "zalo-legal" / "corpus_hyperbolic.jsonl"
         self._content_cache: Dict[int, str] = {}
         self._chunk_cache: Dict[int, Dict[str, Any]] = {}
         # Debug retrieval flag

@@ -23,32 +23,40 @@ from src.utils.paths import get_processed_data_dir, get_models_retrieval_dir
 class LegalHierarchyDataset(Dataset):
     def __init__(self, chunks_path: Path, hierarchy_path: Path):
         self.chunk_texts = {}
+        self.doc_to_chunks = {}
+        self.all_chunk_ids = []
+        
         with open(chunks_path, 'r', encoding='utf-8') as f:
             for line in f:
                 record = json.loads(line)
                 cid = record.get('chunk_id')
+                doc_code = record.get('doc_code', '')
+                
                 if cid is not None:
-                    self.chunk_texts[str(cid)] = record.get('content', '')
+                    cid_str = str(cid)
+                    self.chunk_texts[cid_str] = record.get('content', '')
+                    self.all_chunk_ids.append(cid_str)
                     
-        with open(hierarchy_path, 'r', encoding='utf-8') as f:
-            self.hierarchy = json.load(f)
-            
-        self.documents = list(self.hierarchy["documents"].keys())
-        # Cache chunk IDs
-        self.all_chunk_ids = list(self.hierarchy["chunks"].keys())
+                    if doc_code:
+                        if doc_code not in self.doc_to_chunks:
+                            self.doc_to_chunks[doc_code] = []
+                        self.doc_to_chunks[doc_code].append(cid_str)
+                        
+        self.documents = list(self.doc_to_chunks.keys())
+        # Provide fallback if no corpus was loaded properly
+        if not self.all_chunk_ids:
+            self.all_chunk_ids = ["0"]
+            self.chunk_texts["0"] = ""
         
     def __len__(self):
         return len(self.documents)
         
     def __getitem__(self, idx):
         # Anchor: Parent document
-        # But wait, parent document text is just all articles combined or title?
-        # A simpler proxy for Document embedding is to just use a randomly sampled Article
-        # Let's take doc_code as parent text if no summary exists. Let's assume Document title
         doc_code = self.documents[idx]
         
         # Children articles
-        children = self.hierarchy["documents"][doc_code]["chunks"]
+        children = self.doc_to_chunks.get(doc_code, [])
         if not children:
             # Fallback
             return {"parent_text": "text", "pos_child_text": "text", "neg_child_text": "text"}
@@ -59,7 +67,7 @@ class LegalHierarchyDataset(Dataset):
         
         # Neg child
         neg_id = str(random.choice(self.all_chunk_ids))
-        while neg_id in [str(c) for c in children]:
+        while neg_id in children:
             neg_id = str(random.choice(self.all_chunk_ids))
             
         neg_text = self.chunk_texts.get(neg_id, "")
@@ -103,13 +111,13 @@ def train():
     
     # 4. Data
     dataset = LegalHierarchyDataset(
-        chunks_path=processed_dir / "zalo-legal" / "chunks_schema.jsonl",
+        chunks_path=processed_dir / "zalo-legal" / "corpus_hyperbolic.jsonl",
         hierarchy_path=processed_dir / "zalo-legal" / "hierarchy.json"
     )
     loader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
     
     # 5. Training Loop
-    EPOCHS = 3
+    EPOCHS = 10
     for epoch in range(EPOCHS):
         hyperbolic_proj.train()
         total_loss = 0
@@ -118,9 +126,10 @@ def train():
         for batch in progress:
             # Get Euclidean Base Embeddings
             with torch.no_grad():
-                p_base = base_model.encode(batch["parent_text"], convert_to_tensor=True, device=device)
-                pos_base = base_model.encode(batch["pos_child_text"], convert_to_tensor=True, device=device)
-                neg_base = base_model.encode(batch["neg_child_text"], convert_to_tensor=True, device=device)
+                # Fix RuntimeError by cloning inference tensors
+                p_base = base_model.encode(batch["parent_text"], convert_to_tensor=True, device=device).clone()
+                pos_base = base_model.encode(batch["pos_child_text"], convert_to_tensor=True, device=device).clone()
+                neg_base = base_model.encode(batch["neg_child_text"], convert_to_tensor=True, device=device).clone()
                 
             optimizer.zero_grad()
             
