@@ -26,26 +26,26 @@ ROBOTSTXT_OBEY = True
 # ==============================================================================
 # CONCURRENT REQUESTS & RATE LIMITING
 # ==============================================================================
-CONCURRENT_REQUESTS = 2               # Chỉ 2 request song song
-CONCURRENT_REQUESTS_PER_DOMAIN = 2    # Giới hạn theo domain
-DOWNLOAD_DELAY = 2.0                  # Nghỉ 2s giữa mỗi request
-RANDOMIZE_DOWNLOAD_DELAY = True       # Random hóa delay (0.5x -> 1.5x)
-DOWNLOAD_TIMEOUT = 30                 # Timeout 30s
+CONCURRENT_REQUESTS = 1                 # Giảm xuống 1 để cực kỳ an toàn
+CONCURRENT_REQUESTS_PER_DOMAIN = 1
+DOWNLOAD_DELAY = 5.0                  # Nghỉ 5s để tránh bị block (Gov site nhạy cảm)
+RANDOMIZE_DOWNLOAD_DELAY = True       # Random hóa delay (2.5s -> 7.5s)
+DOWNLOAD_TIMEOUT = 60                 # Tăng timeout cho HTTPS ổn định hơn
 
 # ==============================================================================
 # RETRY
 # ==============================================================================
 RETRY_ENABLED = True
-RETRY_TIMES = 3
-RETRY_HTTP_CODES = [500, 502, 503, 504, 408, 429]
+RETRY_TIMES = 5                       # Tăng lên 5 lần thử lại
+RETRY_HTTP_CODES = [500, 502, 503, 504, 408, 429, 521] # Thêm 521 (Cloudflare/WAF block)
 
 # ==============================================================================
 # AUTO THROTTLE (tự điều chỉnh tốc độ theo response time)
 # ==============================================================================
 AUTOTHROTTLE_ENABLED = True
-AUTOTHROTTLE_START_DELAY = 2
-AUTOTHROTTLE_MAX_DELAY = 10
-AUTOTHROTTLE_TARGET_CONCURRENCY = 1.5
+AUTOTHROTTLE_START_DELAY = 5.0
+AUTOTHROTTLE_MAX_DELAY = 60.0
+AUTOTHROTTLE_TARGET_CONCURRENCY = 1.0
 
 # ==============================================================================
 # HEADERS

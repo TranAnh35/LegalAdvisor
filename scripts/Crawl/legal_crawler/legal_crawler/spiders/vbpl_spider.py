@@ -34,26 +34,41 @@ class VbplSpider(scrapy.Spider):
         self.incremental = str(incremental).lower() in ["true", "1", "yes"]
         self.pbar = None
         self.total_docs = 0
-        
-        # Kết nối DB để check nhanh
-        db_path = Path(self.settings.get("PROJECT_ROOT", ".")) / "data/database/legal_data.db"
-        self.db_exists = db_path.exists()
         self.existing_ids = set()
-        if self.db_exists and self.incremental:
-            try:
-                conn = sqlite3.connect(db_path)
-                cursor = conn.cursor()
-                # Lấy item_id từ source_url trong bảng documents
-                cursor.execute("SELECT source_url FROM documents")
-                for (url,) in cursor.fetchall():
-                    match = re.search(r"ItemID=(\d+)", url, re.I)
-                    if match: self.existing_ids.add(match.group(1))
-                conn.close()
-                self.logger.info(f"Đã tải {len(self.existing_ids)} mã văn bản hiện có từ Database để cào tăng trưởng.")
-            except Exception as e:
-                self.logger.error(f"Lỗi tải cache DB: {e}")
+        # NOTE: self.settings không có sẵn ở đây (gán sau bởi from_crawler)
+        # → Việc đọc DB sẽ thực hiện trong start_requests()
 
-    def start_requests(self):
+    def _load_existing_ids(self):
+        """Tải danh sách ItemID đã có trong DB để hỗ trợ Incremental mode."""
+        db_path = Path(self.settings.get("PROJECT_ROOT", ".")) / "data/database/legal_data.db"
+        if not db_path.exists():
+            self.logger.info("Chưa có DB, sẽ cào toàn bộ từ đầu.")
+            return
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT source_url FROM documents WHERE source_url IS NOT NULL")
+            for (url,) in cursor.fetchall():
+                match = re.search(r"ItemID=(\d+)", url or "", re.I)
+                if match:
+                    self.existing_ids.add(match.group(1))
+            conn.close()
+            self.logger.info(f"Incremental mode: đã tải {len(self.existing_ids)} văn bản hiện có từ DB.")
+        except Exception as e:
+            self.logger.error(f"Lỗi tải cache DB: {e}")
+
+    async def start(self):
+        import sys
+        # Tải danh sách văn bản hiện có nếu ở chế độ incremental
+        if self.incremental:
+            self._load_existing_ids()
+            tqdm.write(f"[Incremental] Đã bỏ qua {len(self.existing_ids)} văn bản đã có trong DB.", file=sys.stderr)
+
+        # Tiền khởi tạo tqdm ngay lập tức
+        self.pbar = tqdm(total=None, desc="⏳ Đang kết nối server", unit="doc",
+                         dynamic_ncols=True, file=sys.stderr)
+        tqdm.write("🚀 Spider vbpl khởi động...", file=sys.stderr)
+
         if self.item_id:
             url = f"{self.BASE_URL}/TW/Pages/vbpq-thuoctinh.aspx?ItemID={self.item_id}"
             yield scrapy.Request(url, callback=self.parse_metadata, meta={'item_id': self.item_id})
@@ -69,12 +84,23 @@ class VbplSpider(scrapy.Spider):
         
         if page == 1:
             try:
+                import sys
                 total_str = response.css(".selected span strong b::text").get()
                 if total_str:
                     clean_total = re.sub(r"\D", "", total_str)
                     self.total_docs = int(clean_total)
-                    self.pbar = tqdm(total=self.total_docs, desc="Progress", unit="doc")
-                    self.logger.info(f"Tổng số văn bản phát hiện trên hệ thống: {self.total_docs}")
+                    # Đóng thanh indeterminate, tạo lại với total thực tế
+                    if self.pbar is not None:
+                        self.pbar.close()
+                    self.pbar = tqdm(
+                        total=self.total_docs,
+                        desc="📥 Cào văn bản",
+                        unit="doc",
+                        dynamic_ncols=True,
+                        file=sys.stderr,
+                        initial=len(self.existing_ids)  # Bắt đầu từ số đã có nếu incremental
+                    )
+                    tqdm.write(f"✅ Tổng {self.total_docs:,} văn bản | Đã có: {len(self.existing_ids):,} | Cần cào: {self.total_docs - len(self.existing_ids):,}", file=sys.stderr)
             except Exception as e:
                 self.logger.warning(f"Không thể khởi tạo tqdm: {e}")
 
@@ -87,7 +113,7 @@ class VbplSpider(scrapy.Spider):
             if item_id:
                 # KIỂM TRA TĂNG TRƯỞNG: Nếu văn bản đã có trong kho và đang ở chế độ incremental=True
                 if self.incremental and item_id in self.existing_ids:
-                    if self.pbar: self.pbar.update(1)
+                    if self.pbar is not None: self.pbar.update(1)
                     continue
                 
                 meta_url = f"{self.BASE_URL}/TW/Pages/vbpq-thuoctinh.aspx?ItemID={item_id}"
@@ -100,6 +126,34 @@ class VbplSpider(scrapy.Spider):
             next_page = page + 1
             next_url = f"{self.SEARCH_API_URL}&Page={next_page}"
             yield scrapy.Request(next_url, callback=self.parse_catalog, meta={'page': next_page})
+
+    def _is_host_structure(self, raw_text, p_class, el):
+        """Kiểm tra xem một thẻ HTML có chắc chắn thuộc về cấu trúc văn bản hiện tại (Host) không."""
+        # 1. Dấu hiệu Class HTML từ Bộ Tư pháp (Host Article luôn có class dieu-p/dieu-h)
+        if "dieu-p" in p_class or bool(el.xpath(".//span[contains(@class, 'dieu-h')]")):
+            return True
+        
+        # 2. Dấu hiệu các mục lớn (thường không nằm trong quote sửa đổi chi tiết Điều)
+        if re.match(r"^(PHẦN|Phần|CHƯƠNG|Chương|MỤC|Mục)\s+", raw_text, re.I):
+            return True
+            
+        # 3. Dấu hiệu câu dẫn sửa đổi đặc trưng của văn bản hiện hành (Host lead-in)
+        if re.match(r"^\d+\.\s+", raw_text):
+            lower_text = raw_text.lower()
+            
+            # Loại bỏ các từ ghép dễ gây nhận diện nhầm cấu trúc pháp lý (Bug 1: địa điểm, điều kiện...)
+            clean_text = re.sub(r"(địa điểm|thời điểm|quan điểm|đặc điểm|điều kiện|điều chỉnh|điều hành|điều tra|tài khoản)", "", lower_text)
+            
+            action_pattern = r"\b(sửa đổi|bổ sung|bãi bỏ|thay thế|hủy bỏ|thay)\b"
+            target_pattern = r"\b(điều|khoản|điểm|cụm từ|đoạn|mục|chương)\b"
+            
+            has_action = bool(re.search(action_pattern, clean_text))
+            has_target = bool(re.search(target_pattern, clean_text))
+            
+            # Chỉ coi là Host nếu dòng đó chứa cả hành động và đối tượng (ví dụ: "1. Khoản 2 Điều 4 được sửa đổi...")
+            if (has_action and has_target) or ("như sau:" in clean_text and has_target):
+                return True
+        return False
 
     def parse_metadata(self, response):
         item_id = response.meta['item_id']
@@ -115,7 +169,7 @@ class VbplSpider(scrapy.Spider):
         
         # Chỉ cào văn bản Còn hiệu lực
         if status and "Còn hiệu lực" not in status:
-            if self.pbar: self.pbar.update(1)
+            if self.pbar is not None: self.pbar.update(1)
             return
 
         doc_code = get_val("Số ký hiệu") or f"unknown_{item_id}"
@@ -137,7 +191,7 @@ class VbplSpider(scrapy.Spider):
         doc_code = response.meta.get('doc_code')
         content_div = response.css("div.toanvancontent") or response.css("div#contentDoc")
         if not content_div: 
-            if self.pbar: self.pbar.update(1)
+            if self.pbar is not None: self.pbar.update(1)
             return
 
         # 1. Title Extraction
@@ -165,6 +219,8 @@ class VbplSpider(scrapy.Spider):
         cur_h = []
         cur_article = None; cur_clause = None; cur_point = None
         cur_text_lines = []; cur_title = ""
+        # Cờ trạng thái: Đánh dấu đang nằm trong vùng nội dung sửa đổi/bổ sung (trích dẫn)
+        in_amendment_block = False
 
         def _get_item():
             nonlocal cur_text_lines
@@ -181,52 +237,106 @@ class VbplSpider(scrapy.Spider):
             )
 
         for el in all_blocks:
-            text = "".join(el.xpath(".//text()").getall()).strip()
-            if not text: continue
+            raw_text = "".join(el.xpath(".//text()").getall()).strip()
+            if not raw_text: continue
+
+            # Lấy class của thẻ p và các span bên trong để phân biệt Chủ (văn bản hiện tại) và Khách (văn bản bị sửa)
+            p_class = el.xpath("./@class").get() or ""
+            is_host_article = "dieu-p" in p_class or bool(el.xpath(".//span[contains(@class, 'dieu-h')]"))
             
-            part_match = re.match(r"^(PHẦN|Phần|CHƯƠNG|Chương|MỤC|Mục)\s+(.*)", text, re.I)
-            if part_match:
-                item = _get_item(); 
-                if item: yield item
-                label = part_match.group(1).capitalize()
-                val = part_match.group(2).strip()
-                if label == "Phần": cur_h = [f"Phần {val}"]
-                elif label == "Chương": cur_h = cur_h[:1] + [f"Chương {val}"] if cur_h and "Phần" in cur_h[0] else [f"Chương {val}"]
-                else: cur_h.append(f"{label} {val}")
-                cur_article = cur_clause = cur_point = None
-                cur_text_lines = []; cur_title = ""
+            # --- XỬ LÝ TRẠNG THÁI KHỐI TRÍCH DẪN (AMENDMENT BLOCK) ---
+            
+            # Thoát quote nếu gặp cấu trúc chủ chắc chắn (phòng hờ gõ thiếu nháy đóng)
+            if self._is_host_structure(raw_text, p_class, el):
+                in_amendment_block = False
+
+            # Nhận diện class của Điều khách (Guest Article)
+            is_guest_article = bool(el.xpath(".//span[contains(@class, 'dieuchar-h')]"))
+            
+            # Nếu dòng bắt đầu bằng nháy kép hoặc là Điều của văn bản bị sửa (Guest)
+            # (Chúng ta ưu tiên check startswith để xử lý các khối thụt lề)
+            if not in_amendment_block and (raw_text.startswith(('“', '"')) or is_guest_article):
+                in_amendment_block = True
+
+            # Nếu đang ở trong vùng trích dẫn, gộp toàn bộ vào text của Điều/Khoản chủ hiện tại
+            if in_amendment_block:
+                if cur_article is not None:
+                    cur_text_lines.append(raw_text)
+                
+                # Nếu kết thúc bằng nháy kép đóng, thoát vùng trích dẫn cho dòng sau
+                if raw_text.endswith(('”', '"')):
+                    in_amendment_block = False
                 continue
 
-            art_match = re.match(r"^(Điều|ĐIỀU)\s+(\d+)[\.:\s]*(.*)", text, re.I)
-            if art_match:
-                item = _get_item(); 
-                if item: yield item
-                cur_article = int(art_match.group(2))
-                cur_title = art_match.group(3).strip()
-                cur_clause = cur_point = None
-                cur_text_lines = []
-                if cur_title and len(cur_title) > 60:
-                    cur_text_lines.append(cur_title); cur_title = ""
-                continue
+            # --- BÓC TÁCH CẤU TRÚC (CHỈ CHẠY KHI KHÔNG Ở TRONG VÙNG TRÍCH DẪN) ---
+            matched_structure = False
 
-            clause_match = re.match(r"^(\d+)\.\s+(.*)", text)
-            if clause_match:
-                item = _get_item()
-                if item: yield item
-                cur_clause = int(clause_match.group(1)); cur_point = None
-                cur_text_lines = [clause_match.group(2).strip()]
-                continue
+            # 1. Tách Điều (Chỉ nhận những thẻ được VBPL đánh dấu là Điều chủ)
+            if is_host_article:
+                art_match = re.match(r"^(Điều|ĐIỀU)\s+(\d+[a-zA-Z]*)[\.:\s]*(.*)", raw_text, re.I)
+                if art_match:
+                    item = _get_item()
+                    if item: yield item
+                    cur_article = art_match.group(2)
+                    cur_title = art_match.group(3).strip()
+                    cur_clause = cur_point = None
+                    cur_text_lines = []
+                    # Nếu title quá dài, đẩy bớt vào nội dung
+                    if cur_title and len(cur_title) > 100:
+                        cur_text_lines.append(cur_title); cur_title = ""
+                    matched_structure = True
 
-            point_match = re.match(r"^([a-z])[\)\.]\s+(.*)", text, re.I)
-            if point_match:
-                item = _get_item()
-                if item: yield item
-                cur_point = point_match.group(1).lower()
-                cur_text_lines = [point_match.group(2).strip()]
-                continue
+            # 2. Tách Phần/Chương/Mục
+            if not matched_structure:
+                part_match = re.match(r"^(PHẦN|Phần|CHƯƠNG|Chương|MỤC|Mục)\s+(.*)", raw_text, re.I)
+                if part_match:
+                    item = _get_item() 
+                    if item: yield item
+                    label = part_match.group(1).capitalize()
+                    val = part_match.group(2).strip()
+                    if label == "Phần": cur_h = [f"Phần {val}"]
+                    elif label == "Chương": cur_h = cur_h[:1] + [f"Chương {val}"] if cur_h and "Phần" in cur_h[0] else [f"Chương {val}"]
+                    else: cur_h.append(f"{label} {val}")
+                    cur_article = cur_clause = cur_point = None
+                    cur_text_lines = []; cur_title = ""
+                    matched_structure = True
 
-            if cur_article:
-                cur_text_lines.append(text)
+            # 3. Tách Khoản (Thỏa mãn tiêu chuẩn số thứ tự đầu dòng)
+            if not matched_structure:
+                clause_match = re.match(r"^(\d+)\.\s+(.*)", raw_text)
+                if clause_match:
+                    item = _get_item()
+                    if item: yield item
+                    cur_clause = int(clause_match.group(1)); cur_point = None
+                    cur_text_lines = [raw_text]  # Giữ nguyên text gốc bao gồm số thứ tự
+                    matched_structure = True
+
+            # 4. Tách Điểm
+            if not matched_structure:
+                point_match = re.match(r"^([a-zđ])[\)\.]\s+(.*)", raw_text, re.I)
+                if point_match:
+                    item = _get_item()
+                    if item: yield item
+                    cur_point = point_match.group(1).lower()
+                    cur_text_lines = [raw_text]  # Giữ nguyên text gốc bao gồm ký hiệu điểm
+                    matched_structure = True
+
+            # 5. Ghi nhận nội dung thường
+            if not matched_structure and cur_article is not None:
+                cur_text_lines.append(raw_text)
+
+            # --- XỬ LÝ QUOTE ĐA DÒNG (Multi-line Quote State Management) ---
+            # Chỉ bật cờ vùng trích dẫn đa dòng nếu có dấu hiệu ngoặc kép MỞ mà không ĐÓNG (Bug 2)
+            if not in_amendment_block:
+                open_q = raw_text.count('“')
+                close_q = raw_text.count('”')
+                
+                # Trích dẫn cong: Mở nhiều hơn đóng -> Bắt đầu khối đa dòng
+                if open_q > close_q:
+                    in_amendment_block = True
+                # Trích dẫn thẳng (ASCII): Đếm nếu số lượng ngoặc là lẻ
+                elif raw_text.count('"') % 2 != 0:
+                    in_amendment_block = True
 
         item = _get_item(); 
         if item: yield item
