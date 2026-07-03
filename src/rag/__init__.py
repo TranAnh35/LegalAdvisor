@@ -1,12 +1,12 @@
 """
 RAG (Retrieval-Augmented Generation) module for LegalAdvisor
 
-Combines document retrieval with Gemini LLM for legal QA.
+Combines document retrieval with a Groq LLM for legal QA.
 
 Components:
-- gemini_rag: GeminiRAG for question answering
+- groq_rag: Groq-backed RAG class for question answering
 """
 
-from .gemini_rag import GeminiRAG
+from .groq_rag import GroqRAG
 
-__all__ = ['GeminiRAG']
+__all__ = ["GroqRAG"]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gemini RAG implementation for LegalAdvisor
+Groq-backed RAG implementation for LegalAdvisor.
 """
 
 import os
@@ -11,12 +11,14 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np  # type: ignore
+import requests  # type: ignore
 
 from dotenv import load_dotenv
 from ..retrieval.service import RetrievalService
 from ..utils.law_registry import normalize_act_code  # type: ignore
 
-GEMINI_MODEL = "gemini-2.5-flash-lite"
+GROQ_DEFAULT_MODEL = "llama-3.1-8b-instant"
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 def _vietnamese_doc_title(type_code: str, number: str) -> str:
     """Chuyển type+number thành tên văn bản thân thiện.
@@ -44,7 +46,7 @@ def _vietnamese_doc_title(type_code: str, number: str) -> str:
     return f"{vn_type} {number}/{code_upper}"
 
 def format_retrieved_docs(docs: List[Dict[str, Any]]) -> str:
-    """Ghép tài liệu tham chiếu kèm tiêu đề luật và nội dung đầy đủ."""
+    """Ghép tài liệu tham khảo kèm tiêu đề luật và nội dung đầy đủ."""
     formatted_docs: List[str] = []
     for i, doc in enumerate(docs, 1):
         corpus_id = doc.get('corpus_id') or ''
@@ -57,19 +59,22 @@ def format_retrieved_docs(docs: List[Dict[str, Any]]) -> str:
         law_title = _vietnamese_doc_title(type_code, number)
 
         content = (doc.get('content_full') or doc.get('content') or '').strip()
-        # Hiển thị thân thiện: thay '_' bằng ' ' trong nội dung tham chiếu
+        # Hiển thị thân thiện: thay '_' bằng ' ' trong nội dung tham khảo
         snippet = content.replace('_', ' ')
 
         formatted_docs.append(
-            f"[Nguồn {i}] {law_title}{(' - ' + dieu) if dieu else ''} — `{corpus_id}`\n{snippet}\n(điểm: {doc.get('score', 0):.2f})"
+            f"[Nguời {i}] {law_title}{(' - ' + dieu) if dieu else ''} — `{corpus_id}`\n{snippet}\n(điểm: {doc.get('score', 0):.2f})"
         )
     return "\n\n".join(formatted_docs)
 
-class GeminiRAG:
-    """RAG implementation using Google's Gemini for legal question answering"""
+class GroqRAG:
+    """RAG implementation using Groq for legal question answering.
+
+    This is the primary RAG class used by the API.
+    """
     
     def __init__(self, use_gpu: bool = False):
-        """Initialize the GeminiRAG system"""
+        """Initialize the Groq-backed RAG system."""
         self.use_gpu = use_gpu
         self.retriever = None
         self.model = None
@@ -77,75 +82,40 @@ class GeminiRAG:
         
         # Initialize components
         self._initialize_retriever()
-        self._initialize_gemini()
+        self._initialize_llm()
         
         # Log only via logger, not print (to avoid console noise)
         import logging
         _logger = logging.getLogger("legaladvisor.rag")
-        _logger.info("GeminiRAG initialized successfully")
+        _logger.info("Groq RAG initialized successfully")
     
     def _initialize_retriever(self):
         """Initialize unified RetrievalService"""
         try:
             self.retriever = RetrievalService(use_gpu=self.use_gpu)
-            # Mirror thông tin phục vụ /stats
+            # Mirror thong tin phuc vu /stats
             self.model_info = getattr(self.retriever, 'model_info', {})
             self.metadata = getattr(self.retriever, 'metadata', {})
         except Exception as e:
             raise RuntimeError(f"Failed to initialize retriever: {str(e)}")
     
-    def _initialize_gemini(self):
-        """Initialize the Gemini model"""
+    def _initialize_llm(self):
+        """Initialize Groq chat-completions settings."""
         try:
-            # Load env and require API key at runtime (not at import time)
             load_dotenv()
-            google_api_key = os.getenv('GOOGLE_API_KEY')
-            if not google_api_key:
-                raise RuntimeError("GOOGLE_API_KEY not found in environment variables")
+            api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+            if not api_key or api_key.strip().lower().startswith("your_"):
+                raise RuntimeError("GROQ_API_KEY not found in environment variables")
 
-            # Import and configure google.generativeai lazily so importing this
-            # module (or running tests that mock RAG) does not fail when the key
-            # is not set.
-            import google.generativeai as genai  # imported here intentionally
-
-            genai.configure(api_key=google_api_key)
-
-            # Initialize the Gemini model
-            generation_config = {
-                "temperature": 0.1,  # thấp hơn để giảm suy diễn
-                "top_p": 0.9,
-                "top_k": 40,
-                "max_output_tokens": 2048 * 4,
-            }
-
-            safety_settings = [
-                {
-                    "category": "HARM_CATEGORY_HARASSMENT",
-                    "threshold": "BLOCK_NONE"
-                },
-                {
-                    "category": "HARM_CATEGORY_HATE_SPEECH",
-                    "threshold": "BLOCK_NONE"
-                },
-                {
-                    "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                    "threshold": "BLOCK_NONE"
-                },
-                {
-                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                    "threshold": "BLOCK_NONE"
-                },
-            ]
-
-            self.model = genai.GenerativeModel(
-                model_name=GEMINI_MODEL,
-                generation_config=generation_config,
-                safety_settings=safety_settings
-            )
-            
+            self.groq_api_key = api_key
+            self.groq_model = (os.getenv("GROQ_MODEL") or os.getenv("OPENROUTER_MODEL") or GROQ_DEFAULT_MODEL).strip() or GROQ_DEFAULT_MODEL
+            self.groq_api_url = (os.getenv("GROQ_API_URL") or os.getenv("OPENROUTER_API_URL") or GROQ_API_URL).strip() or GROQ_API_URL
+            self.groq_site_url = (os.getenv("GROQ_SITE_URL") or os.getenv("OPENROUTER_SITE_URL") or "http://localhost:8501").strip()
+            self.groq_app_name = (os.getenv("GROQ_APP_NAME") or os.getenv("OPENROUTER_APP_NAME") or "LegalAdvisor Mini").strip()
+            self.model = {"provider": "groq", "model": self.groq_model}
         except Exception as e:
-            raise RuntimeError(f"Failed to initialize Gemini model: {str(e)}")
-    
+            raise RuntimeError(f"Failed to initialize Groq model: {str(e)}")
+
     def retrieve_documents(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
         """Retrieve relevant documents for a query"""
         try:
@@ -158,7 +128,7 @@ class GeminiRAG:
 
     @staticmethod
     def _score_to_similarity(score: float) -> float:
-        """Chuyển inner-product trên vector chuẩn hoá [-1,1] về [0,1] để ước lượng confidence."""
+        """Chuyển inner-product trên vector chuẩn hóa [-1,1] về [0,1] để ước lượng confidence."""
         try:
             x = float(score)
             # IP của vectors đã normalize nằm trong [-1, 1]. Quy về [0,1]
@@ -169,7 +139,7 @@ class GeminiRAG:
     def _group_by_document(self, docs: List[Dict[str, Any]], top_k_docs: int) -> List[Dict[str, Any]]:
         """Nhóm các chunk theo tài liệu (act_code_norm) và chọn top-k tài liệu.
 
-        Chiến lược gộp có thể cấu hình qua ENV:
+        Chiến lược ghép có thể cấu hình qua ENV:
         - LEGALADVISOR_GROUP_STRATEGY: mean (mặc định) | max | topm_mean
         - LEGALADVISOR_GROUP_TOPM: số m khi dùng topm_mean (mặc định 3)
         """
@@ -238,7 +208,7 @@ class GeminiRAG:
                 'best_score': float(g['best_score']) if g['best_score'] is not None else None,
             })
 
-        # Sắp xếp theo group_score giảm dần, tie-break bằng best_score giảm dần
+        
         grouped.sort(key=lambda x: (-x['group_score'], -(x['best_score'] if x['best_score'] is not None else -1e9)))
         return grouped[:max(1, int(top_k_docs))]
 
@@ -309,17 +279,17 @@ class GeminiRAG:
         # Nới lỏng giới hạn context vì Gemini có context window lớn;
         # vẫn cho phép cấu hình lại qua ENV nếu cần.
         try:
-            total_budget = int(os.getenv("LEGALADVISOR_CONTEXT_TOTAL_CHARS", "200000"))
+            total_budget = int(os.getenv("LEGALADVISOR_CONTEXT_TOTAL_CHARS", "50000"))
         except Exception:
-            total_budget = 200000
+            total_budget = 50000
         try:
-            per_doc_budget = int(os.getenv("LEGALADVISOR_CONTEXT_DOC_CHARS", "40000"))
+            per_doc_budget = int(os.getenv("LEGALADVISOR_CONTEXT_DOC_CHARS", "12000"))
         except Exception:
-            per_doc_budget = 40000
+            per_doc_budget = 12000
         try:
-            citation_budget = int(os.getenv("LEGALADVISOR_CONTEXT_CITATION_CHARS", "20000"))
+            citation_budget = int(os.getenv("LEGALADVISOR_CONTEXT_CITATION_CHARS", "5000"))
         except Exception:
-            citation_budget = 20000
+            citation_budget = 5000
         try:
             max_segments_per_article = int(os.getenv("LEGALADVISOR_CONTEXT_MAX_SEGMENTS_PER_ARTICLE", "10"))
         except Exception:
@@ -327,7 +297,7 @@ class GeminiRAG:
         if max_segments_per_article <= 0:
             max_segments_per_article = 10
 
-        # Map (act_code_norm, Điều) -> chunk_id và danh sách segment part trúng theo score
+        # Map (act_code_norm, Điều) -> chunk_id và danh sách segment part trùng theo score
         article_chunk_ids: Dict[tuple, int] = {}
         article_hit_parts: Dict[tuple, List[int]] = {}
         # Map act_code_norm -> metadata (type_code, number, year) để hiển thị tiêu đề văn bản thân thiện
@@ -391,7 +361,7 @@ class GeminiRAG:
         parts: List[str] = []
         remaining = total_budget
 
-        # ===== OPTIMIZATION: Parallel fetching của articles =====
+        # ===== OPTIMIZATION: Parallel fetching cá»§a articles =====
         # 1) Chuẩn bị danh sách articles cần fetch
         articles_to_fetch: List[tuple] = []  # (code, article_num)
         for g in (sources_grouped or []):
@@ -467,7 +437,7 @@ class GeminiRAG:
             body_sections: List[str] = []
             used = 0
             if isinstance(articles, list) and len(articles) > 0:
-                # Ưu tiên những Điều đã có segment trúng
+                # Ưu tiên những Điều đã có segment trùng
                 hits: List[int] = []
                 others: List[int] = []
                 for a in articles:
@@ -490,7 +460,7 @@ class GeminiRAG:
                     chunk_id = article_chunk_ids.get(key)
                     section_body = ""
 
-                    # Nếu có chunk_id -> ưu tiên ghép theo các segment trúng
+                    # Nếu có chunk_id -> Ưu tiên ghép theo các segment trùng
                     if chunk_id is not None:
                         seg_defs = self.retriever.get_article_segments_text(chunk_id, max_segments=max_segments_per_article)
                         seg_by_part: Dict[int, str] = {}
@@ -544,7 +514,7 @@ class GeminiRAG:
                     used += len(section)
                     body_sections.append(section)
 
-            # Nếu không có danh sách Điều hoặc phần Điều rỗng -> lấy toàn văn bản
+            # Nếu không có danh sách Điều hoặc phần Điều trống -> lấy toàn văn bản
             if not body_sections:
                 full_text = self.retriever.get_document_text_all(code) or ""
                 ft = full_text.replace('_', ' ').strip()
@@ -560,7 +530,7 @@ class GeminiRAG:
         # 2) Nội dung tài liệu trích dẫn
         if remaining > 0:
             try:
-                # Trích dẫn từ nội dung các chunk đã truy hồi
+                # Trích dẫn từ nội dung các chunk đã truy vấn
                 from ..retrieval.citation.extract import extract_citations  # type: ignore
                 from ..utils.law_registry import get_registry  # type: ignore
                 reg = None
@@ -697,7 +667,7 @@ class GeminiRAG:
                 entry["score"] = float(sum(top_scores) / len(top_scores))
 
     def _apply_adaptive_threshold(self, article_entries: Dict[tuple, Dict[str, Any]], 
-                                   detail_level: str = "moderate") -> tuple[List[Dict[str, Any]], float]:
+                                   detail_level: str = "brief") -> tuple[List[Dict[str, Any]], float]:
         """Áp dụng adaptive threshold để filter articles.
         
         Returns: (filtered_articles, threshold_used)
@@ -982,66 +952,99 @@ class GeminiRAG:
             })
         return grouped
     
+    @staticmethod
+    def _clean_llm_answer(text: str) -> str:
+        """Remove special tokens/noisy sections that should not appear in the UI answer."""
+        cleaned = (text or "").strip()
+        for token in ("<pad>", "</s>", "<s>"):
+            cleaned = cleaned.replace(token, "")
+        # UI already renders sources separately, so drop duplicated source sections if a model ignores the prompt.
+        stop_markers = (
+            "\nNguồn tài liệu:",
+            "\nNguồn tham khảo:",
+            "\nCăn cứ pháp lý:",
+            "\nTài liệu tham khảo:",
+        )
+        for marker in stop_markers:
+            idx = cleaned.lower().find(marker.lower())
+            if idx >= 0:
+                cleaned = cleaned[:idx].strip()
+        # Normalize excessive blank lines after token cleanup.
+        while "\n\n\n" in cleaned:
+            cleaned = cleaned.replace("\n\n\n", "\n\n")
+        return cleaned.strip()
+
     def generate_response(self, question: str, context: str = None, **kwargs) -> str:
-        """Generate a response using Gemini"""
+        """Generate a concise answer using Groq."""
         try:
-            # Ensure Gemini model is initialized at call-time. This allows
-            # importing the module (e.g., in tests) without GOOGLE_API_KEY set.
             if not getattr(self, 'model', None):
                 try:
-                    self._initialize_gemini()
+                    self._initialize_llm()
                 except Exception as e:
-                    # Fail gracefully: return an informative message rather than
-                    # raising at import or runtime in user-facing paths.
-                    print(f"Error initializing Gemini: {e}")
-                    return "Xin lỗi, hệ thống chưa cấu hình mô hình ngôn ngữ. Vui lòng thiết lập GOOGLE_API_KEY."
+                    print(f"Error initializing Groq: {e}")
+                    return "Xin lỗi, hệ thống chưa cấu hình mô hình ngôn ngữ. Vui lòng thiết lập GROQ_API_KEY."
 
-            # Prepare the prompt
+            system_prompt = (
+                "Bạn là trợ lý pháp lý tiếng Việt. Trả lời đúng trọng tâm, ngắn gọn và chỉ dựa trên ngữ cảnh được cung cấp. "
+                "Không tự tạo mục 'Nguồn tài liệu', 'Nguồn tham khảo' hoặc 'Căn cứ pháp lý' vì giao diện đã hiển thị nguồn riêng. "
+                "Không đưa corpus-id, chunk-id, điểm số retrieval hoặc token kỹ thuật vào câu trả lời. "
+                "Không bao giờ in các token đặc biệt như <pad>, </s>, <s>. "
+                "Nếu ngữ cảnh không đủ để trả lời chắc chắn, nói ngắn gọn rằng chưa đủ căn cứ trong nguồn đã trích."
+            )
+
             if context:
-                # Prompt chuyên biệt cho pháp luật Việt Nam, có định dạng rõ ràng cho câu trả lời
-                prompt = (
-                    "Bạn là trợ lý pháp lý tiếng Việt, chuyên phân tích và trích dẫn đúng quy định pháp luật Việt Nam.\n"
-                    "Trả lời CHỈ dựa trên phần 'Ngữ cảnh pháp lý' bên dưới; không sử dụng kiến thức bên ngoài.\n"
-                    "\n"
-                    "YÊU CẦU ĐỊNH DẠNG CÂU TRẢ LỜI:\n"
-                    "1. Dòng đầu tiên: ghi tên văn bản pháp luật chính áp dụng (hoặc 2–3 văn bản chính nếu có nhiều), "
-                    "ví dụ: 'Luật Doanh nghiệp 2020' hoặc 'Luật Doanh nghiệp 2020; Nghị định 01/2021/NĐ-CP'.\n"
-                    "2. Phần 'Tư vấn': trình bày ngắn gọn, dễ hiểu, 3–7 gạch đầu dòng nêu trực tiếp câu trả lời cho người dùng.\n"
-                    "3. Phần 'Căn cứ pháp lý':\n"
-                    "   - Nhóm các trích dẫn theo từng văn bản (Luật/Nghị định/Thông tư/Quyết định…).\n"
-                    "   - Với mỗi văn bản, liệt kê các trích dẫn dạng (Tên văn bản – Điều ? – Khoản ? – Điểm ?).\n"
-                    "   - Nếu không xác định được Khoản/Điểm thì có thể bỏ trống phần đó.\n"
-                    "4. Phần 'Nguồn tài liệu': liệt kê lại các nguồn đã sử dụng; với mỗi nguồn, ghi tên văn bản "
-                    "(hãy thay mọi dấu '_' bằng khoảng trắng để dễ đọc) và tóm tắt rất ngắn (1 câu) nội dung chính.\n"
-                    "5. Không chèn mã nguồn kỹ thuật, id nội bộ, corpus-id, chunk-id… vào câu trả lời.\n"
-                    "6. Nếu ngữ cảnh không đủ căn cứ rõ ràng để trả lời, hãy nêu rõ: "
-                    "\"Không đủ căn cứ trong nguồn đã trích\" và gợi ý thêm văn bản/thuật ngữ nên tra cứu.\n"
-                    "7. Nội dung chỉ mang tính tham khảo, không thay thế ý kiến tư vấn của luật sư hoặc cơ quan nhà nước có thẩm quyền.\n"
-                    "\n"
-                    "Ngữ cảnh pháp lý (các trích đoạn luật, nghị định, thông tư… đã được hệ thống truy xuất):\n"
+                user_prompt = (
+                    "Chỉ dựa trên phần 'Ngữ cảnh pháp lý' dưới đây để trả lời câu hỏi.\n\n"
+                    "YÊU CẦU TRẢ LỜI:\n"
+                    "- Trả lời trực tiếp vào câu hỏi, không mở rộng sang nội dung không được hỏi.\n"
+                    "- Độ dài tối đa 1-2 đoạn ngắn hoặc 3-5 gạch đầu dòng nếu cần liệt kê.\n"
+                    "- Không viết các mục: 'Văn bản', 'Tư vấn', 'Căn cứ pháp lý', 'Nguồn tài liệu', 'Nguồn tham khảo'.\n"
+                    "- Không liệt kê tên văn bản/điều khoản nguồn trong phần trả lời; phần nguồn đã do UI đảm nhiệm.\n"
+                    "- Không sao chép nguyên văn dài từ ngữ cảnh; hãy diễn giải ngắn gọn, dễ hiểu.\n"
+                    "- Nếu có nhiều nguồn nhưng chỉ một phần liên quan, chỉ dùng phần liên quan nhất.\n\n"
+                    "Ngữ cảnh pháp lý:\n"
                     f"{context}\n\n"
-                    f"Câu hỏi của người dùng: {question}\n"
+                    f"Câu hỏi: {question}\n"
                 )
             else:
-                prompt = (
-                    "Bạn là trợ lý pháp lý tiếng Việt, chuyên hỗ trợ tra cứu pháp luật Việt Nam.\n"
-                    "Hãy trả lời ngắn gọn, rõ ràng, dễ hiểu và ưu tiên đưa ra trích dẫn pháp lý khi có thể.\n"
-                    "Nếu bạn không chắc chắn về câu trả lời hoặc không có đủ thông tin, hãy nói rõ điều đó "
-                    "và khuyến nghị người dùng tham khảo luật sư/chuyên gia hoặc cơ quan nhà nước có thẩm quyền.\n"
-                    f"\nCâu hỏi của người dùng: {question}\n"
+                user_prompt = (
+                    "Trả lời ngắn gọn và nói rõ nếu không đủ thông tin pháp lý để kết luận.\n"
+                    "Không tạo phần nguồn tài liệu hoặc căn cứ pháp lý.\n"
+                    f"Câu hỏi: {question}\n"
                 )
-            
-            # Generate response
-            response = self.model.generate_content(prompt)
 
-            # Return the generated text
-            return response.text
-            
+            payload = {
+                "model": self.groq_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": float(os.getenv("GROQ_TEMPERATURE", os.getenv("OPENROUTER_TEMPERATURE", "0.1"))),
+                "max_tokens": int(os.getenv("GROQ_MAX_TOKENS", os.getenv("OPENROUTER_MAX_TOKENS", "700"))),
+            }
+            headers = {
+                "Authorization": f"Bearer {self.groq_api_key}",
+                "Content-Type": "application/json",
+            }
+            if self.groq_site_url:
+                headers["HTTP-Referer"] = self.groq_site_url
+            if self.groq_app_name:
+                headers["X-Title"] = self.groq_app_name
+
+            timeout = int(os.getenv("GROQ_TIMEOUT_SECONDS", os.getenv("OPENROUTER_TIMEOUT_SECONDS", "60")))
+            response = requests.post(self.groq_api_url, headers=headers, json=payload, timeout=timeout)
+            if response.status_code >= 400:
+                try:
+                    detail = response.json()
+                except Exception:
+                    detail = response.text
+                raise RuntimeError(f"Groq request failed ({response.status_code}): {detail}")
+            data = response.json()
+            return self._clean_llm_answer(data["choices"][0]["message"]["content"])
         except Exception as e:
             print(f"Error generating response: {str(e)}")
             return "Xin lỗi, tôi gặp lỗi khi xử lý yêu cầu của bạn. Vui lòng thử lại sau."
-    
-    def ask(self, question: str, top_k: int = 3, detail_level: str = "moderate") -> Dict[str, Any]:
+    def ask(self, question: str, top_k: int = 3, detail_level: str = "brief") -> Dict[str, Any]:
         """Process a question and return the answer with sources
         
         Args:
@@ -1146,7 +1149,7 @@ class GeminiRAG:
                 # Fallback an toàn: vẫn cố gắng cung cấp snippet cho LLM
                 context = format_retrieved_docs(filtered_docs) if filtered_docs else None
             
-            # Step 4: Generate response using Gemini
+            # Step 4: Generate response using Groq
             answer = self.generate_response(question, context)
 
             # Không thêm block tham khảo vào câu trả lời để tránh trùng với UI. UI sẽ hiển thị sources.
@@ -1200,13 +1203,13 @@ class GeminiRAG:
         """Trả về nội dung chunk theo id từ SQLite/Parquet (ưu tiên)."""
         return self._get_chunk_content_by_id(chunk_id)
 
-def test_gemini_rag():
-    """Test the GeminiRAG implementation"""
+def test_groq_rag():
+    """Test the Groq-backed RAG implementation."""
     try:
-        print("🚀 Testing GeminiRAG...")
+        print("🚀 Testing Groq RAG...")
         
         # Initialize RAG
-        rag = GeminiRAG(use_gpu=False)
+        rag = GroqRAG(use_gpu=False)
         
         # Test query
         query = "Điều kiện để thành lập doanh nghiệp tư nhân?"
@@ -1232,4 +1235,4 @@ def test_gemini_rag():
         print(f"❌ Test failed: {str(e)}")
 
 if __name__ == "__main__":
-    test_gemini_rag()
+    test_groq_rag()

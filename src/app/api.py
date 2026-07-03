@@ -19,7 +19,6 @@ import time
 import threading
 from collections import defaultdict, deque
 from datetime import datetime
-import traceback
 
 # Import logger
 try:
@@ -37,16 +36,16 @@ except ImportError:
     def log_error(message):
         logger.error(message)
 
-# Import RAG pipeline - Sử dụng GeminiRAG
+# Import RAG pipeline - sử dụng Groq-backed RAG class
 import argparse
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 try:
     # Ưu tiên import tuyệt đối để tránh lỗi 'attempted relative import with no known parent package'
-    from src.rag.gemini_rag import GeminiRAG  # type: ignore
+    from src.rag.groq_rag import GroqRAG  # type: ignore
 except ImportError:
     # Fallback if absolute import fails
-    from ..rag.gemini_rag import GeminiRAG  # type: ignore
+    from ..rag.groq_rag import GroqRAG  # type: ignore
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='LegalAdvisor API Server')
@@ -55,7 +54,7 @@ parser.add_argument('--port', type=int, default=8000, help='Port để chạy se
 parser.add_argument('--use-gpu', action='store_true', help='Sử dụng GPU nếu có sẵn')
 args, unknown = parser.parse_known_args()
 
-# Initialize RAG system: luôn dùng GeminiRAG (lazy init để tăng tốc khởi động)
+# Initialize RAG system: dùng Groq-backed RAG (lazy init để tăng tốc khởi động)
 rag_system = None
 rag_last_error: Optional[str] = None
 rag_init_lock = threading.Lock()
@@ -99,16 +98,16 @@ def _init_rag(force: bool = False) -> bool:
         rag_retry_info["last_attempt_at"] = _now_iso()
 
         try:
-            from ..rag.gemini_rag import GeminiRAG
-            rag_system = GeminiRAG(use_gpu=args.use_gpu)
+            from ..rag.groq_rag import GroqRAG
+            rag_system = GroqRAG(use_gpu=args.use_gpu)
             rag_last_error = None
             rag_retry_info["last_success_at"] = rag_retry_info["last_attempt_at"]
             rag_retry_info["last_error"] = None
             # Only log, don't print to reduce console noise
-            logger.info("GeminiRAG initialized successfully")
+            logger.info("Groq RAG initialized successfully")
             return True
         except Exception as e:
-            error_msg = f"Failed to initialize GeminiRAG: {e}"
+            error_msg = f"Failed to initialize Groq RAG: {e}"
             rag_system = None
             rag_last_error = str(e)
             rag_retry_info["last_error"] = str(e)
@@ -126,27 +125,24 @@ def _init_rag_background():
             return
         if attempt < max_retries:
             logger.warning(
-                f"Retrying GeminiRAG initialization in {delay_seconds}s (attempt {attempt}/{max_retries})"
+                f"Retrying Groq RAG initialization in {delay_seconds}s (attempt {attempt}/{max_retries})"
             )
             time.sleep(delay_seconds)
-    logger.error("GeminiRAG failed to initialize after retries")
+    logger.error("Groq RAG failed to initialize after retries")
 
 
 if not SKIP_RAG_INIT:
     threading.Thread(target=_init_rag_background, daemon=True).start()
 else:
-    logger.info("Skipping GeminiRAG background init (LEGALADVISOR_SKIP_RAG_INIT=1)")
+    logger.info("Skipping Groq RAG background init (LEGALADVISOR_SKIP_RAG_INIT=1)")
 
-# Khởi động thread dọn dẹp rate-limit nếu bật
-if False:
-    pass
 
 # Pydantic models
 class QuestionRequest(BaseModel):
     # Giới hạn chiều dài câu hỏi để tránh lạm dụng (mặc định 1024)
     question: constr(min_length=1, max_length=1024)  # type: ignore
     # Mức chi tiết: brief | moderate | comprehensive (mặc định: moderate)
-    detail_level: str = "moderate"  # type: ignore
+    detail_level: str = "brief"  # type: ignore
     # Legacy: giữ để backward compatible (không dùng)
     top_k: conint(ge=1, le=50) = 3  # type: ignore
 
@@ -163,7 +159,7 @@ class AnswerResponse(BaseModel):
     sources_grouped: List[Dict[str, Any]] = []
     num_docs: int = 0  # Alias cho num_sources
     threshold_used: float = 0.0  # Threshold value áp dụng
-    detail_level: str = "moderate"  # Mức chi tiết được sử dụng
+    detail_level: str = "brief"  # Mức chi tiết được sử dụng
     status: str = "success"
     citations: List[Dict[str, Any]] = []
 
@@ -255,7 +251,7 @@ async def health_details():
 async def warmup(llm: bool = False):
     """Khởi tạo RAG và chạy một lượt retrieval (và tùy chọn LL.M) để giảm độ trễ lần đầu.
 
-    - llm=False: chỉ warm retrieval (không tốn token Gemini), mặc định.
+    - llm=False: chỉ warm retrieval (không tốn token Groq), mặc định.
     - llm=True: gọi một lượt generate_response với prompt ngắn để warm model (sẽ tốn token).
     """
     loaded = _init_rag(force=False)
@@ -304,9 +300,10 @@ def _sanitize_sensitive(text: Optional[str]) -> Optional[str]:
     if not text:
         return text
     masked = str(text)
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if api_key:
-        masked = masked.replace(api_key, "***")
+    for api_key_name in ("GROQ_API_KEY",):
+        api_key = os.getenv(api_key_name)
+        if api_key:
+            masked = masked.replace(api_key, "***")
     return masked
 
 
@@ -366,7 +363,7 @@ async def ask_question(request: QuestionRequest, _: None = Depends(rate_limit_de
 
     if rag_system is None:
         if _init_rag():
-            logger.info("GeminiRAG reinitialized on-demand")
+            logger.info("Groq RAG reinitialized on-demand")
         else:
             log_error("RAG system not available")
             raise HTTPException(
@@ -374,13 +371,13 @@ async def ask_question(request: QuestionRequest, _: None = Depends(rate_limit_de
                 detail={
                     "message": "RAG system is not available",
                     "error": _sanitize_sensitive(rag_last_error),
-                    "hint": "Verify GOOGLE_API_KEY and retrieval models are configured."
+                    "hint": "Verify GROQ_API_KEY and retrieval models are configured."
                 }
             )
 
     try:
         # Xử lý câu hỏi
-        # Sử dụng GeminiRAG.ask với detail_level (brief/moderate/comprehensive)
+        # Sử dụng RAG.ask với detail_level (brief/moderate/comprehensive)
         result = rag_system.ask(request.question, detail_level=request.detail_level)
 
         response_time = time.time() - start_time
@@ -397,30 +394,6 @@ async def ask_question(request: QuestionRequest, _: None = Depends(rate_limit_de
             # Import chậm để tránh chi phí khởi động
             from ..retrieval.citation.extract import extract_citations  # type: ignore
 
-            @app.get("/debug/retrieval_test", tags=["Debug"], summary="Chẩn đoán truy hồi thô")
-            async def debug_retrieval_test(q: str, top_k: int = 3):
-                """Trả về kết quả truy hồi thô (không gọi LLM) giúp debug trường hợp num_sources=0.
-
-                Bật ENV `LEGALADVISOR_DEBUG_RETRIEVAL=1` để có thêm log chi tiết.
-                """
-                if rag_system is None:
-                    if not _init_rag():
-                        raise HTTPException(status_code=503, detail="RAG system not available")
-                try:
-                    docs = rag_system.retrieve_documents(q, top_k=top_k)
-                    return {
-                        "query": q,
-                        "top_k": top_k,
-                        "num_results": len(docs),
-                        "scores": [d.get("score", 0.0) for d in docs],
-                        "corpus_ids": [d.get("corpus_id") for d in docs],
-                    }
-                except Exception as e:
-                    return {
-                        "query": q,
-                        "error": str(e),
-                        "trace": traceback.format_exc()
-                    }
             from ..utils.law_registry import get_registry  # type: ignore
             reg = None
             try:

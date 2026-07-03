@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Dịch vụ truy hồi tài liệu thống nhất cho LegalAdvisor (Zalo-Legal schema).
 
@@ -10,6 +10,7 @@ Dịch vụ truy hồi tài liệu thống nhất cho LegalAdvisor (Zalo-Legal s
 from __future__ import annotations
 
 import importlib
+import hashlib
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -35,7 +36,10 @@ class RetrievalService:
     def __init__(self, use_gpu: bool = False) -> None:
         # Thư mục models/retrieval
         self.model_dir: Path = get_models_retrieval_dir()
-        self.index_dir: Path = self.model_dir / "index_v2"
+        self.index_dir: Path = self._resolve_runtime_path(
+            os.getenv("LEGALADVISOR_INDEX_DIR"),
+            self.model_dir / "index",
+        )
         self.use_gpu: bool = bool(use_gpu)
         self._logger = get_logger("legaladvisor.retrieval")
         # Thiết bị mục tiêu cho encoder (GPU nếu được yêu cầu và khả dụng)
@@ -62,8 +66,8 @@ class RetrievalService:
                     data = json.load(f)
                     # Map old field names to new ones
                     self.model_info = {
-                        "model_path": str(self.model_dir / "zalo_v1"),
-                        "model_name": data.get("base_model", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"),
+                        "model_path": str(self.model_dir / "base_encoder"),
+                        "model_name": data.get("base_model", "intfloat/multilingual-e5-small"),
                         **{k: v for k, v in data.items() if k not in ["base_model"]}
                     }
 
@@ -75,24 +79,36 @@ class RetrievalService:
                 self.index_info = json.load(f)
 
         # Load metadata và bảng tra theo chunk_id
-        metadata_path = self.model_dir / "metadata.json"
+        metadata_path = self.index_dir / "metadata.json"
+        if not metadata_path.exists():
+            metadata_path = self.model_dir / "metadata.json"
         self._meta_by_id: Dict[int, Dict[str, Any]] = {}
+        self.index_metadata: Dict[str, Any] = {}
         if metadata_path.exists():
             with open(metadata_path, 'r', encoding='utf-8') as f:
-                metadata: List[Dict[str, Any]] = json.load(f)
-            for entry in metadata:
-                chunk_id = entry.get('chunk_id')
-                if chunk_id is None:
-                    continue
-                try:
-                    self._meta_by_id[int(chunk_id)] = entry
-                except (TypeError, ValueError):
-                    continue
-
+                metadata = json.load(f)
+            if isinstance(metadata, list):
+                for entry in metadata:
+                    if not isinstance(entry, dict):
+                        continue
+                    chunk_id = entry.get('chunk_id')
+                    if chunk_id is None:
+                        continue
+                    try:
+                        self._meta_by_id[int(chunk_id)] = entry
+                    except (TypeError, ValueError):
+                        continue
+            elif isinstance(metadata, dict):
+                self.index_metadata = metadata
         # Load FAISS index
         index_path = self.index_dir / "chunks_index.faiss"
         if not index_path.exists():
             index_path = self.model_dir / "faiss_index.bin"
+        if not index_path.exists():
+            raise FileNotFoundError(
+                f"FAISS index not found in {self.index_dir}. "
+                "Run src/retrieval/build_index.py or set LEGALADVISOR_INDEX_DIR."
+            )
         self.index = faiss.read_index(str(index_path))
 
         # Map FAISS id -> chunk_id (khi dùng IndexIDMap)
@@ -146,7 +162,11 @@ class RetrievalService:
                 encoder_source = candidate
 
         # Try to load a local encoder nếu có; fallback sang model gốc trên HF khi cần.
-        model_name = self.model_info.get("model_name") or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        model_name = (
+            os.getenv("LEGALADVISOR_EMBEDDING_MODEL")
+            or self.model_info.get("model_name")
+            or "intfloat/multilingual-e5-small"
+        )
         encoder_errors: List[str] = []
         self.encoder: Optional[SentenceTransformer] = None
 
@@ -216,7 +236,11 @@ class RetrievalService:
 
         # Đường dẫn JSONL content store (schema mới)
         self.processed_dir: Path = get_processed_data_dir()
-        self.jsonl_path: Path = self.processed_dir / "zalo-legal" / "chunks_schema.jsonl"
+        self.jsonl_path: Path = self._resolve_runtime_path(
+            os.getenv("LEGALADVISOR_CHUNKS_PATH"),
+            self.processed_dir / "zalo-legal" / "chunks_schema.jsonl",
+        )
+        self._warn_if_chunks_index_mismatch()
         self._content_cache: Dict[int, str] = {}
         self._chunk_cache: Dict[int, Dict[str, Any]] = {}
         # Debug retrieval flag
@@ -235,6 +259,15 @@ class RetrievalService:
         # Performance gain: O(n) scan → O(1) lookup per chunk_id
         self._all_records_cached: bool = False
         self._load_indexed_records_on_init()
+
+    @staticmethod
+    def _resolve_runtime_path(raw_path: Optional[str], default: Path) -> Path:
+        if raw_path:
+            candidate = Path(raw_path).expanduser()
+            if candidate.is_absolute():
+                return candidate.resolve()
+            return (Path.cwd() / candidate).resolve()
+        return default.resolve()
 
     @staticmethod
     def _normalize_lookup_code(value: str) -> str:
@@ -313,7 +346,7 @@ class RetrievalService:
                 except Exception as exc2:
                     # Fallback: reload encoder từ tên base model mặc định
                     try:
-                        fallback_name = self._base_model_name or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+                        fallback_name = self._base_model_name or "intfloat/multilingual-e5-small"
                         self._logger.warning("Reloading fallback encoder due to encode error: %s", exc2)
                         self.encoder = self._load_sentence_transformer_safe(fallback_name)
                         if hasattr(self.encoder, "max_seq_length"):
@@ -956,6 +989,51 @@ class RetrievalService:
                 pass
         return None
 
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _warn_if_chunks_index_mismatch(self) -> None:
+        """Warn early when the content JSONL is not the file used to build FAISS."""
+        expected_hash = str(self.index_info.get("chunks_sha256") or "").strip()
+        expected_rows = self.index_info.get("chunks_rows") or self.index_info.get("num_chunks")
+        if not self.jsonl_path.exists():
+            self._logger.warning("Chunks file not found: %s", self.jsonl_path)
+            return
+
+        if expected_hash:
+            try:
+                current_hash = self._sha256_file(self.jsonl_path)
+                if current_hash != expected_hash:
+                    self._logger.warning(
+                        "Chunks/index mismatch: %s does not match the chunks file used to build FAISS. "
+                        "Rebuild the index after preprocessing.",
+                        self.jsonl_path,
+                    )
+            except Exception as exc:
+                self._logger.warning("Could not verify chunks hash for %s: %s", self.jsonl_path, exc)
+            return
+
+        if expected_rows:
+            try:
+                current_rows = 0
+                with self.jsonl_path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if line.strip():
+                            current_rows += 1
+                if int(current_rows) != int(expected_rows):
+                    self._logger.warning(
+                        "Chunks/index row-count mismatch: chunks=%s index=%s. Rebuild index after preprocessing.",
+                        current_rows,
+                        expected_rows,
+                    )
+            except Exception as exc:
+                self._logger.warning("Could not verify chunks row count for %s: %s", self.jsonl_path, exc)
+
     def _load_indexed_records_on_init(self) -> None:
         """Load toàn bộ JSONL file vào indexed cache on-startup.
         
@@ -1080,5 +1158,6 @@ class RetrievalService:
                 os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             else:
                 os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda
+
 
 

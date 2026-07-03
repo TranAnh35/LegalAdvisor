@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -34,20 +35,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--base-model",
         type=str,
-        default=None,
-        help="Tên model SentenceTransformer trên HuggingFace. Nếu cung cấp, sẽ tải và lưu vào --model-dir",
+        default="intfloat/multilingual-e5-small",
+        help="Tên model SentenceTransformer trên HuggingFace. Mặc định dùng base model E5 multilingual-small.",
     )
     parser.add_argument(
         "--model-dir",
         type=Path,
-        default=Path("models/retrieval/zalo_v1"),
-        help="Đường dẫn thư mục model SentenceTransformer đã fine-tune",
+        default=Path("models/retrieval/base_encoder"),
+        help="Thư mục lưu encoder cục bộ dùng để build/search index",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("models/retrieval/index"),
         help="Thư mục output cho index và metadata",
+    )
+    parser.add_argument(
+        "--use-local-model",
+        action="store_true",
+        help="Load encoder tu --model-dir thay vi tai va luu base model tu HuggingFace",
     )
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size khi encode")
     parser.add_argument(
@@ -56,6 +62,7 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Thiết bị encode: auto/cpu/cuda",
     )
+    parser.add_argument("--save-embeddings", action="store_true", help="Lưu thêm vectors.npy và chunk_embeddings.npy để debug")
     parser.add_argument("--verbose", action="store_true", help="Bật logging chi tiết")
     return parser.parse_args()
 
@@ -92,6 +99,13 @@ def read_chunks(path: Path) -> Tuple[List[str], List[dict]]:
     logging.info("Đọc %d chunks từ %s", len(records), path)
     return texts, records
 
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 def pick_device(device_arg: str) -> str:
     if device_arg == "auto":
@@ -415,16 +429,19 @@ def save_artifacts(
     model_name: str,
     segment_meta: Dict[str, int | bool] | None = None,
     num_source_chunks: int | None = None,
+    chunks_path: Path | None = None,
+    save_embeddings: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    raw_path = output_dir / "vectors.npy"
-    logging.info("Lưu vectors gốc tại %s", raw_path)
-    np.save(raw_path, raw_embeddings.astype(np.float32))
+    if save_embeddings:
+        raw_path = output_dir / "vectors.npy"
+        logging.info("Lưu vectors gốc tại %s", raw_path)
+        np.save(raw_path, raw_embeddings.astype(np.float32))
 
-    normalized_path = output_dir / "chunk_embeddings.npy"
-    logging.info("Lưu vectors chuẩn hóa tại %s", normalized_path)
-    np.save(normalized_path, normalized_embeddings.astype(np.float32))
+        normalized_path = output_dir / "chunk_embeddings.npy"
+        logging.info("Lưu vectors chuẩn hóa tại %s", normalized_path)
+        np.save(normalized_path, normalized_embeddings.astype(np.float32))
 
     index_path = output_dir / "chunks_index.faiss"
     logging.info("Lưu FAISS index tại %s", index_path)
@@ -461,6 +478,11 @@ def save_artifacts(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "sentence_transformers_version": sentence_transformers.__version__,
     }
+    if chunks_path is not None:
+        resolved_chunks_path = chunks_path.resolve()
+        model_info["chunks_path"] = str(resolved_chunks_path)
+        model_info["chunks_sha256"] = sha256_file(resolved_chunks_path)
+        model_info["chunks_rows"] = int(num_source_chunks)
     if segment_meta:
         try:
             model_info["segment_length"] = int(segment_meta.get("segment_length", 0))  # type: ignore[arg-type]
@@ -490,7 +512,8 @@ def main() -> None:
         raise FileNotFoundError(f"Không tìm thấy file chunks: {chunks_path}")
     texts, records = read_chunks(chunks_path)
     device = pick_device(args.device)
-    model = load_or_prepare_model(args.base_model, model_dir, device)
+    base_model = None if args.use_local_model else args.base_model
+    model = load_or_prepare_model(base_model, model_dir, device)
     # Xây dựng các đoạn biểu diễn (multi-vector per Điều) cho index
     segment_texts, id_rows, faiss_ids, segment_meta = build_segments_for_index(records, model)
     raw_embeddings = encode_chunks(segment_texts, model, max(1, args.batch_size), device, max_seq_length=int(segment_meta.get("segment_length", 256)))
@@ -501,9 +524,9 @@ def main() -> None:
     try:
         # sentence_transformers >=2.x thường có thuộc tính model_name_or_path ở module đầu
         first = model[0]
-        used_name = getattr(first, 'model_name_or_path', None) or args.base_model or str(model_dir)
+        used_name = getattr(first, 'model_name_or_path', None) or base_model or str(model_dir)
     except Exception:
-        used_name = args.base_model or str(model_dir)
+        used_name = base_model or str(model_dir)
 
     # Số Điều nguồn (mỗi record là một Điều/chunk nghiệp vụ)
     num_source_chunks = len(records)
@@ -517,6 +540,8 @@ def main() -> None:
         used_name,
         segment_meta=segment_meta,
         num_source_chunks=num_source_chunks,
+        chunks_path=chunks_path,
+        save_embeddings=bool(args.save_embeddings),
     )
     logging.info("Hoàn tất build index. Output: %s", output_dir)
 

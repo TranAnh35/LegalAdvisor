@@ -5,7 +5,7 @@ from src.app import api
 
 
 class DummyRAG:
-    def ask(self, question: str, top_k: int = 3):
+    def ask(self, question: str, top_k: int = 3, detail_level: str = "brief"):
         return {
             "question": question,
             "answer": "Dummy answer",

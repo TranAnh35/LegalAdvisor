@@ -1,11 +1,11 @@
-"""
+﻿"""
 LegalAdvisor Source Module
 
 Main source code for the LegalAdvisor NLP legal QA system.
 
 Packages:
 - app: FastAPI backend and Streamlit UI
-- rag: Retrieval-Augmented Generation using Gemini
+- rag: Retrieval-Augmented Generation using Groq
 - retrieval: Document retrieval using FAISS
 - data_preprocessing: Data preprocessing pipelines
 - utils: Utility functions and helpers

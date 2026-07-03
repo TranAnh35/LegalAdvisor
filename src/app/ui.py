@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Streamlit UI cho LegalAdvisor
 """
@@ -187,8 +187,8 @@ def main():
 
     if not health.get("rag_loaded", False):
         st.warning("⚠️ RAG system chưa được tải. Một số tính năng có thể không hoạt động.")
-        st.info("💡 Kiểm tra GOOGLE_API_KEY và khởi động API bằng launcher:")
-        st.code("$env:GOOGLE_API_KEY='YOUR_KEY'; python launcher.py")
+        st.info("💡 Kiểm tra GROQ_API_KEY và khởi động API bằng launcher:")
+        st.code("$env:GROQ_API_KEY='YOUR_KEY'; python launcher.py")
         if st.button("🔄 Thử khởi động lại RAG", use_container_width=True):
             reinit_result = trigger_reinitialize_rag()
             if reinit_result and reinit_result.get("status_code") == 200 and reinit_result.get("rag_loaded"):
