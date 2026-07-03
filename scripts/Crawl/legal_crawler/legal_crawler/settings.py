@@ -12,6 +12,10 @@ BOT_NAME = "legal_crawler"
 SPIDER_MODULES = ["legal_crawler.spiders"]
 NEWSPIDER_MODULE = "legal_crawler.spiders"
 
+# Gemini 1.5 Flash API Key (Free tier)
+# Lấy tại: https://aistudio.google.com/app/apikey
+GEMINI_API_KEY = "AIzaSyBOhOS7tAKp6IUDnRCMGWursvXSaqX2B2c"
+
 import os
 from pathlib import Path
 # Detect project root (LegalAdvisor)
@@ -64,11 +68,11 @@ USER_AGENT = (
 # PIPELINES
 # ==============================================================================
 ITEM_PIPELINES = {
-    "legal_crawler.pipelines.DeduplicationPipeline": 100,
-    "legal_crawler.pipelines.CleanTextPipeline": 200,
-    "legal_crawler.pipelines.SQLitePipeline": 300,
-    "legal_crawler.pipelines.ProgressPipeline": 400,
-    "legal_crawler.pipelines.JsonlExportPipeline": 900,
+    "legal_crawler.pipelines.CleanTextPipeline": 100,      # Làm sạch Markdown trước
+    "legal_crawler.pipelines.SQLitePipeline": 200,        # Lưu Metadata vào DB
+    "legal_crawler.pipelines.MarkdownStoragePipeline": 300, # Lưu file .md
+    "legal_crawler.pipelines.LegalAIPipeline": 400,        # Gọi AI bóc tách cấu trúc (MỚI)
+    "legal_crawler.pipelines.ProgressPipeline": 500,       # Cập nhật thanh tiến độ
 }
 
 # ==============================================================================
