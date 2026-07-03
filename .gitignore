@@ -1,4 +1,4 @@
-# Environment variables
+﻿# Environment variables
 .env
 .env.local
 .env.*.local
@@ -67,3 +67,14 @@ data/
 .cursor/
 .windsurf/
 .github/
+
+# Local/private model artifacts
+models/retrieval/**/checkpoint-*/
+models/retrieval/**/vectors.npy
+models/retrieval/**/chunk_embeddings.npy
+local_finetuned.env
+models/retrieval/base_encoder/
+models/retrieval/index/
+models/retrieval/legacy_*/
+local_artifacts_backup/
+

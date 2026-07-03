@@ -1,353 +1,283 @@
-#!/usr/bin/env python3
-"""
-Launcher đơn giản cho LegalAdvisor
-"""
+﻿#!/usr/bin/env python3
+"""Launcher đơn giản cho LegalAdvisor Mini."""
 
-import sys
+from __future__ import annotations
+
+import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
+
 from dotenv import load_dotenv
-import json
 
-def check_requirements():
-    """Kiểm tra các yêu cầu cơ bản"""
-    print("🔍 Kiểm tra yêu cầu hệ thống...")
 
-    # Kiểm tra GPU và hiển thị thông tin
-    print("🔥 Kiểm tra GPU support...")
-    try:
-        import torch
-        gpu_available = torch.cuda.is_available()
-        if gpu_available:
-            gpu_count = torch.cuda.device_count()
-            gpu_name = torch.cuda.get_device_name(0)
-            print(f"✅ GPU available: {gpu_name} ({gpu_count} GPU(s))")
-            print("   🚀 LegalAdvisor will use GPU acceleration for better performance!")
-        else:
-            print("⚠️  GPU not available - using CPU mode")
-            print("   💡 Run 'python check_gpu.py' for GPU setup instructions")
-    except ImportError:
-        print("⚠️  PyTorch not found - GPU check skipped")
+api_process: subprocess.Popen | None = None
+ui_process: subprocess.Popen | None = None
 
-    # Kiểm tra thư mục cần thiết
-    required_dirs = ["data/processed", "models"]
-    for dir_path in required_dirs:
-        if not Path(dir_path).exists():
-            print(f"⚠️ Thiếu thư mục: {dir_path}")
-            Path(dir_path).mkdir(parents=True, exist_ok=True)
-            print(f"✅ Đã tạo thư mục: {dir_path}")
 
-    # Kiểm tra dataset (ưu tiên pipeline mới Zalo-Legal)
-    dataset_files = [
-        # Dữ liệu đã tiền xử lý cho pipeline mới
-        "data/processed/zalo-legal/chunks_schema.jsonl"
-    ]
+def configure_console_encoding() -> None:
+    """Dùng UTF-8 khi Windows console đang ở code page hẹp."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
-    missing_datasets = []
-    for file_path in dataset_files:
-        if not Path(file_path).exists():
-            missing_datasets.append(file_path)
 
-    if missing_datasets:
-        print("ℹ️  Chưa tìm thấy dữ liệu đã tiền xử lý cho pipeline Zalo-Legal:")
-        for missing in missing_datasets:
-            print(f"   - {missing}")
-        print("   → Hãy chạy: python scripts/zalo_legal_preprocess.py (sau khi đã download)")
+def print_rebuild_steps() -> None:
+    print("   Pipeline chuẩn bị dữ liệu/index:")
+    print("      python scripts/dataset/download.py        # nếu chưa có raw corpus")
+    print("      python scripts/zalo_legal_preprocess.py")
+    print("      python src/retrieval/build_index.py")
+    print("      python scripts/utils/build_law_registry.py")
 
-    # Kiểm tra mô hình retrieval đã sẵn sàng chưa (hỗ trợ index_v2, index và cấu trúc cũ)
+
+def check_requirements() -> bool:
+    """Kiểm tra dữ liệu, index và cấu hình tối thiểu trước khi chạy app."""
+    print("Kiểm tra yêu cầu hệ thống...")
+
+    for dir_path in ("data/processed", "models"):
+        path = Path(dir_path)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+            print(f"Đã tạo thư mục: {dir_path}")
+
+    chunks_path = Path("data/processed/zalo-legal/chunks_schema.jsonl")
+    if not chunks_path.exists():
+        print("Chưa tìm thấy dữ liệu đã tiền xử lý:")
+        print(f"   - {chunks_path}")
+        print_rebuild_steps()
+        return False
+
     retrieval_dir = Path("models/retrieval")
-    index_candidates = [
-        ("index_v2", retrieval_dir / "index_v2"),
-        ("index", retrieval_dir / "index"),
-    ]
-    selected_index = None
-    for label, base_dir in index_candidates:
-        idx_path = base_dir / "chunks_index.faiss"
-        info_path = base_dir / "model_info.json"
-        meta_path = base_dir / "metadata.json"
-        if base_dir.exists() and idx_path.exists() and info_path.exists():
-            selected_index = {
-                "label": label,
-                "base_dir": base_dir,
-                "index_path": idx_path,
-                "info_path": info_path,
-                "meta_path": meta_path,
-            }
-            break
+    index_dir = retrieval_dir / "index"
+    index_path = index_dir / "chunks_index.faiss"
+    info_path = index_dir / "model_info.json"
+    metadata_path = index_dir / "metadata.json"
 
-    # Cấu trúc cũ (1 file index + 1 model_info)
     old_index_path = retrieval_dir / "faiss_index.bin"
     old_info_path = retrieval_dir / "model_info.json"
-    old_meta_path = retrieval_dir / "metadata.json"
+    old_metadata_path = retrieval_dir / "metadata.json"
 
-    has_new = selected_index is not None
-    has_old = retrieval_dir.exists() and old_index_path.exists() and old_info_path.exists()
+    has_new_index = index_path.exists() and info_path.exists()
+    has_old_index = old_index_path.exists() and old_info_path.exists()
 
-    if not has_new and not has_old:
-        print("⚠️  Thiếu mô hình retrieval (FAISS/metadata/model_info).")
-        print("   💡 Vui lòng chạy riêng bước build index trước khi launch:")
-        print("      conda activate LegalAdvisor")
-        print("      python src/retrieval/build_index.py")
-    else:
-        # Ưu tiên đọc model_info theo cấu trúc mới
-        info_path = selected_index["info_path"] if has_new else old_info_path
-        try:
-            with open(info_path, 'r', encoding='utf-8') as f:
-                mi = json.load(f)
-            model_name = mi.get('model_name')
-            dim = mi.get('embedding_dim')
-            metric = mi.get('metric_type', 'ip')
-            pooling = mi.get('pooling', 'unknown')
-            location = f"{selected_index['label']}/" if has_new else "legacy/"
-            print(f"🔧 Retrieval model: {model_name} | dim={dim} | metric={metric} | pooling={pooling} ({location})")
-        except Exception:
-            print("ℹ️  Không đọc được model_info.json để hiển thị thông tin mô hình.")
-        # Cảnh báo nhẹ nếu thiếu metadata (chỉ ảnh hưởng endpoint /stats)
-        if has_new:
-            meta_exists = selected_index["meta_path"].exists()
-        else:
-            meta_exists = old_meta_path.exists()
-        if not meta_exists:
-            print("ℹ️  Chưa tìm thấy metadata.json (chỉ ảnh hưởng thống kê /stats).")
+    if not has_new_index and not has_old_index:
+        print("Thiếu FAISS index hoặc model_info.json.")
+        print_rebuild_steps()
+        return False
 
-    print("✅ Kiểm tra hoàn thành!")
+    selected_info = info_path if has_new_index else old_info_path
+    selected_metadata = metadata_path if has_new_index else old_metadata_path
+    location = "models/retrieval/index" if has_new_index else "models/retrieval legacy"
+
+    try:
+        model_info = json.loads(selected_info.read_text(encoding="utf-8"))
+        model_name = model_info.get("model_name") or model_info.get("base_model") or "unknown"
+        dim = model_info.get("embedding_dim", "unknown")
+        chunks = model_info.get("num_chunks", "unknown")
+        segments = model_info.get("num_segments", "unknown")
+        print(f"Retrieval index: {location}")
+        print(f"Model: {model_name} | dim={dim} | chunks={chunks} | segments={segments}")
+    except Exception:
+        print("Không đọc được model_info.json để hiển thị thông tin retrieval.")
+
+    if not selected_metadata.exists():
+        print("Chưa tìm thấy metadata.json; việc này chủ yếu ảnh hưởng endpoint thống kê.")
+
+    print("Kiểm tra hoàn tất.")
     return True
 
-# Global variables
-api_process = None
-ui_process = None
 
-def start_api_server(use_gpu=False):
-    """Khởi động API server với subprocess
-    
-    Args:
-        use_gpu (bool): Có sử dụng GPU hay không
-    """
+def detect_gpu() -> bool:
+    env_override = os.environ.get("LEGALADVISOR_USE_GPU")
+    if env_override is not None:
+        use_gpu = env_override.lower() in ("1", "true", "yes", "on")
+        print("LEGALADVISOR_USE_GPU: bật GPU" if use_gpu else "LEGALADVISOR_USE_GPU: dùng CPU")
+        return use_gpu
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            print("Phát hiện GPU, sẽ dùng GPU cho API.")
+            return True
+    except Exception:
+        pass
+
+    print("Không dùng GPU, chạy CPU.")
+    return False
+
+
+def start_api_server(use_gpu: bool = False) -> bool:
+    """Khởi động FastAPI backend."""
     global api_process
 
-    try:
-        print("🚀 Khởi động API server...")
-        cmd = [
-            sys.executable,
-            "-m", "src.app.api",
-            "--host", "0.0.0.0",
-            "--port", "8000"
-        ]
-        
-        # Thêm tùy chọn --use-gpu nếu được yêu cầu
-        if use_gpu:
-            cmd.append("--use-gpu")
-            print("   🚀 Chế độ GPU đã được kích hoạt")
-        else:
-            print("   ⚡ Chế độ CPU")
-
-        # Nạp .env để lấy GOOGLE_API_KEY nếu có
-        try:
-            load_dotenv()
-        except Exception:
-            pass
-
-        # Bắt buộc sử dụng Gemini: yêu cầu GOOGLE_API_KEY và đặt RAG_ENGINE=gemini
-        env = os.environ.copy()
-        if not env.get("GOOGLE_API_KEY"):
-            raise RuntimeError("GOOGLE_API_KEY chưa được thiết lập. Vui lòng tạo .env và đặt GOOGLE_API_KEY.")
-        env["RAG_ENGINE"] = "gemini"
-        # Truyền hint sử dụng GPU cho các tiến trình con
-        env["LEGALADVISOR_USE_GPU"] = "1" if use_gpu else "0"
-        api_process = subprocess.Popen(cmd, env=env)
-        print("✅ API server đã khởi động (PID: {})".format(api_process.pid))
-
-    except Exception as e:
-        print(f"❌ Lỗi khởi động API: {e}")
-        return False
-
-    return True
-
-def start_ui_server():
-    """Khởi động UI server bằng streamlit run để tránh cảnh báo bare mode"""
-    global ui_process
-
-    try:
-        print("🚀 Khởi động UI server (streamlit run)...")
-        cmd = [
-            sys.executable, "-m", "streamlit", "run",
-            "src/app/ui.py",
-            "--server.address", "localhost",
-            "--server.port", "8501",
-            "--browser.gatherUsageStats", "false",
-            "--server.headless", "true"
-        ]
-
-        env = os.environ.copy()
-        ui_process = subprocess.Popen(cmd, env=env)
-        print("✅ UI server đã khởi động (PID: {})".format(ui_process.pid))
-
-    except Exception as e:
-        print(f"❌ Lỗi khởi động UI: {e}")
-        return False
-
-    return True
-
-def stop_servers():
-    """Dừng tất cả servers"""
-    global api_process, ui_process
-
-    print("\n🔄 Đang dừng servers...")
-
-    # Dừng API process
-    if api_process:
-        try:
-            api_process.terminate()
-            api_process.wait(timeout=5)
-            print("✅ API server stopped")
-        except subprocess.TimeoutExpired:
-            api_process.kill()
-            print("✅ API server force killed")
-        except Exception as e:
-            print(f"⚠️ Lỗi dừng API: {e}")
-
-    # Dừng UI process
-    if ui_process:
-        try:
-            ui_process.terminate()
-            ui_process.wait(timeout=5)
-            print("✅ UI server stopped")
-        except subprocess.TimeoutExpired:
-            ui_process.kill()
-            print("✅ UI server force killed")
-        except Exception as e:
-            print(f"⚠️ Lỗi dừng UI: {e}")
-
-def signal_handler(signum, frame):
-    """Handle shutdown signals"""
-    print(f"\n🛑 Nhận tín hiệu {signum}, đang tắt hệ thống...")
-    stop_servers()
-    print("👋 Cảm ơn đã sử dụng LegalAdvisor!")
-    sys.exit(0)
-
-def main():
-    """Hàm chính"""
-    # Nạp .env sớm để các ENV như GOOGLE_API_KEY/LEGALADVISOR_* có hiệu lực
     try:
         load_dotenv()
     except Exception:
         pass
-    print("\n" + "="*50)
-    print("   🏛️  LegalAdvisor - Hệ thống hỗ trợ pháp lý")
-    print("="*50 + "\n")
-    
-    # Kiểm tra xem có cờ ép buộc sử dụng CPU hay không (env override)
-    use_gpu = False
-    env_override = os.environ.get("LEGALADVISOR_USE_GPU")
-    if env_override is not None:
-        # Accept common truthy/falsy values
-        if env_override.lower() in ("1", "true", "yes", "on"):
-            use_gpu = True
-            print("✅ LEGALADVISOR_USE_GPU env override: bật GPU")
-        else:
-            use_gpu = False
-            print("✅ LEGALADVISOR_USE_GPU env override: tắt GPU (sử dụng CPU)")
-    else:
-        try:
-            import torch
-            if torch.cuda.is_available():
-                use_gpu = True
-                print("✅ Đã phát hiện GPU, sẽ sử dụng GPU để tăng tốc xử lý")
-            else:
-                print("ℹ️  Không phát hiện GPU, sẽ sử dụng CPU")
-        except ImportError:
-            print("⚠️  Không thể kiểm tra GPU do chưa cài đặt PyTorch")
-    print("🤖 Sử dụng Google Gemini cho text generation (bắt buộc)")
 
-    # Setup signal handlers
+    env = os.environ.copy()
+    groq_key = (env.get("GROQ_API_KEY") or "").strip()
+    if not groq_key or groq_key.lower().startswith("your_"):
+        print("GROQ_API_KEY chưa được thiết lập. Hãy tạo .env từ .env.sample.")
+        return False
+
+    env["RAG_ENGINE"] = "groq"
+    env["LEGALADVISOR_USE_GPU"] = "1" if use_gpu else "0"
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "src.app.api",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+    ]
+    if use_gpu:
+        cmd.append("--use-gpu")
+
+    print("Khởi động API server...")
+    api_process = subprocess.Popen(cmd, env=env)
+    print(f"API server PID: {api_process.pid}")
+    return True
+
+
+def start_ui_server() -> bool:
+    """Khởi động Streamlit UI."""
+    global ui_process
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        "src/app/ui.py",
+        "--server.address",
+        "localhost",
+        "--server.port",
+        "8501",
+        "--browser.gatherUsageStats",
+        "false",
+        "--server.headless",
+        "true",
+    ]
+
+    print("Khởi động UI server...")
+    ui_process = subprocess.Popen(cmd, env=os.environ.copy())
+    print(f"UI server PID: {ui_process.pid}")
+    return True
+
+
+def stop_servers() -> None:
+    """Dừng API và UI nếu đang chạy."""
+    global api_process, ui_process
+
+    print("\nĐang dừng servers...")
+    for name, process in (("API", api_process), ("UI", ui_process)):
+        if process is None:
+            continue
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+            print(f"{name} server đã dừng.")
+        except subprocess.TimeoutExpired:
+            process.kill()
+            print(f"{name} server đã bị buộc dừng.")
+        except Exception as exc:
+            print(f"Lỗi khi dừng {name}: {exc}")
+
+
+def signal_handler(signum, frame) -> None:  # type: ignore[no-untyped-def]
+    print(f"\nNhận tín hiệu {signum}, đang tắt hệ thống...")
+    stop_servers()
+    sys.exit(0)
+
+
+def wait_for_api(max_wait_seconds: int = 60) -> bool:
+    """Đợi API healthcheck sẵn sàng."""
+    import requests
+
+    start_time = time.time()
+    attempt = 0
+    while time.time() - start_time < max_wait_seconds:
+        attempt += 1
+        if api_process and api_process.poll() is not None:
+            print("API server đã dừng trong lúc khởi động.")
+            print_rebuild_steps()
+            return False
+
+        try:
+            response = requests.get("http://localhost:8000/health", timeout=3)
+            if response.status_code == 200:
+                print("API server đã sẵn sàng.")
+                return True
+            print(f"/health trả về {response.status_code} (attempt {attempt})")
+        except Exception:
+            pass
+        time.sleep(1)
+
+    print("Không thể kết nối API trong 60 giây.")
+    print("Hãy kiểm tra GROQ_API_KEY, models/retrieval, data/processed và log API.")
+    print_rebuild_steps()
+    return False
+
+
+def main() -> None:
+    configure_console_encoding()
+    try:
+        load_dotenv()
+    except Exception:
+        pass
+
+    print("\n" + "=" * 50)
+    print("LegalAdvisor - Hệ thống hỗ trợ pháp lý")
+    print("=" * 50 + "\n")
+
+    use_gpu = detect_gpu()
+    print("Sử dụng Groq cho text generation.")
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Kiểm tra yêu cầu
     if not check_requirements():
         sys.exit(1)
 
-    print("\n🚀 Khởi động hệ thống...")
-
     try:
-        # Khởi động API server
         if not start_api_server(use_gpu=use_gpu):
-            print("❌ Không thể khởi động API server")
             sys.exit(1)
-
-        # Đợi API khởi động với vòng retry (tối đa 60 giây)
-        print("⏳ Đợi API server khởi động hoàn toàn (tối đa 60s)...")
-        import requests
-        max_wait_seconds = 60
-        start_time_wait = time.time()
-        attempt = 0
-        while True:
-            attempt += 1
-            # Nếu process API đã thoát, thông báo lỗi sớm
-            if api_process and api_process.poll() is not None:
-                print("❌ API server đã dừng trong quá trình khởi động. Vui lòng xem logs hiển thị từ API.")
-                print("💡 Gợi ý: kiểm tra GOOGLE_API_KEY, thư mục models/retrieval và kết nối internet.")
-                print("   → Nếu cần xây lại index: python src/retrieval/build_index.py")
-                sys.exit(1)
-
-            try:
-                response = requests.get("http://localhost:8000/health", timeout=3)
-                if response.status_code == 200:
-                    print("✅ API server đã sẵn sàng!")
-                    break
-                else:
-                    print(f"⚠️ /health trả về: {response.status_code} (attempt {attempt})")
-            except Exception:
-                # Chưa sẵn sàng, tiếp tục đợi
-                pass
-
-            elapsed = time.time() - start_time_wait
-            if elapsed >= max_wait_seconds:
-                print("❌ Không thể kết nối API trong 60 giây.")
-                print("💡 Gợi ý: kiểm tra GOOGLE_API_KEY, thư mục models/retrieval và logs của API.")
-                print("   → Nếu thiếu index: python src/retrieval/build_index.py")
-                break
-            time.sleep(1)
-
-        # Khởi động UI server
+        if not wait_for_api():
+            stop_servers()
+            sys.exit(1)
         if not start_ui_server():
-            print("❌ Không thể khởi động UI server")
             stop_servers()
             sys.exit(1)
 
-        print("\n🎉 Hệ thống đã sẵn sàng!")
-        print("=" * 50)
-        print("📱 Truy cập:")
-        print("   - Web UI: http://localhost:8501")
-        print("   - API: http://localhost:8000")
-        print("   - API Docs: http://localhost:8000/docs")
-        print("\n🛑 Nhấn Ctrl+C để dừng hệ thống")
-        print("=" * 50)
+        print("\nHệ thống đã sẵn sàng.")
+        print("Web UI: http://localhost:8501")
+        print("API: http://localhost:8000")
+        print("API Docs: http://localhost:8000/docs")
+        print("Nhấn Ctrl+C để dừng hệ thống.")
 
-        # Giữ main thread chạy và monitor processes
         while True:
-            # Kiểm tra xem processes còn chạy không
             if api_process and api_process.poll() is not None:
-                print("⚠️ API server đã dừng bất ngờ")
+                print("API server đã dừng bất ngờ.")
                 break
             if ui_process and ui_process.poll() is not None:
-                print("⚠️ UI server đã dừng bất ngờ")
+                print("UI server đã dừng bất ngờ.")
                 break
-
             time.sleep(1)
-
     except KeyboardInterrupt:
-        print("\n🛑 Đang dừng hệ thống...")
+        pass
+    finally:
         stop_servers()
-        print("👋 Cảm ơn đã sử dụng LegalAdvisor!")
 
-    except Exception as e:
-        print(f"\n❌ Lỗi: {e}")
-        stop_servers()
-        print("👋 Cảm ơn đã sử dụng LegalAdvisor!")
 
 if __name__ == "__main__":
     main()
